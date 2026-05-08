@@ -29,6 +29,7 @@ from analyzer import analyze_posts
 from signals import generate_signals
 from trader import execute_signals, print_run_summary
 from performance import update_performance, print_performance_summary, backfill_performance_from_trades
+import dashboard
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,7 @@ def run_pipeline() -> None:
     )
     logger.info("Pipeline run complete in %.1fs", run_duration)
 
+    dashboard.set_last_run()
     print_performance_summary()
 
 
@@ -172,6 +174,9 @@ def main() -> None:
 
     # Initialise database schema
     init_db()
+
+    # Start the web dashboard on port 5000
+    dashboard.start()
 
     # One-time backfill of any pre-existing trades into the performance table
     backfill_performance_from_trades()
