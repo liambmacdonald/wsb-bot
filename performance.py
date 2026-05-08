@@ -112,24 +112,32 @@ def _fetch_option_market_price(
     # ── Attempt live fetch for unexpired contracts ────────────────────────────
     if not is_expired and expiry_str:
         try:
+            print(f"  [options] fetching: contract={contract_symbol}  ticker={ticker}  expiry={expiry_str[:10]}  strike={strike}  type={opt_type}")
             t = yf.Ticker(ticker)
             chain = t.option_chain(expiry_str[:10])
             df = chain.calls if opt_type.upper() == "CALL" else chain.puts
 
-            match = df[df["contractSymbol"] == contract_symbol]
+            # Strike-based lookup — more reliable than contract symbol matching
+            match = df[df["strike"] == float(strike)]
+            print(f"  [options] strike={strike} matched {len(match)} row(s) (contractSymbol match: {contract_symbol in df['contractSymbol'].values if 'contractSymbol' in df.columns else 'N/A'})")
             if not match.empty:
                 row = match.iloc[0]
                 bid = _safe_float(row.get("bid"))
                 ask = _safe_float(row.get("ask"))
+                last = _safe_float(row.get("lastPrice"))
+                print(f"  [options] bid={bid}  ask={ask}  last={last}")
                 if bid > 0 and ask > 0:
                     return (bid + ask) / 2, "live"
                 if ask > 0:
                     return ask, "live"
-                last = _safe_float(row.get("lastPrice"))
                 if last > 0:
                     return last, "live"
+            else:
+                avail = sorted(df["strike"].tolist())[:10] if not df.empty else []
+                print(f"  [options] no row for strike={strike}; available strikes (first 10): {avail}")
         except Exception as exc:
             logger.warning("Option chain fetch failed for %s (%s): %s", contract_symbol, ticker, exc)
+            print(f"  [options] chain fetch error for {ticker}: {exc}")
 
     # ── Expired: intrinsic value at the expiry stock price ───────────────────
     if is_expired:

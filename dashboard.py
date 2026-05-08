@@ -62,149 +62,162 @@ def index():
 
 @app.route("/api/stats")
 def api_stats():
-    conn = _db()
+    # ── DB fetch ────────────────────────────────────────────────────────────────
+    rows: list[dict] = []
+    bot_status_row: dict | None = None
     try:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM performance").fetchall()]
+        conn = _db()
         try:
-            bot_row = conn.execute("SELECT * FROM bot_status WHERE id = 1").fetchone()
-            bot_status_row = dict(bot_row) if bot_row else None
-        except Exception:
-            bot_status_row = None
-    except Exception:
-        rows = []
-        bot_status_row = None
-    finally:
-        conn.close()
-
-    total = len(rows)
-
-    resolved_6h = [r for r in rows if r.get("percent_change_6h") is not None]
-    wins_6h = sum(1 for r in resolved_6h if r.get("outcome_6h") == "WIN")
-    win_rate_6h = round(wins_6h / len(resolved_6h) * 100, 1) if resolved_6h else None
-
-    resolved_24h = [r for r in rows if r.get("percent_change_24h") is not None]
-    wins_24h = sum(1 for r in resolved_24h if r.get("outcome") == "WIN")
-    win_rate_24h = round(wins_24h / len(resolved_24h) * 100, 1) if resolved_24h else None
-
-    best_call = None
-    def _pct(r: dict) -> float:
-        return r.get("percent_change_24h") or r.get("percent_change_6h") or 0.0
-
-    resolved_any = [r for r in rows if r.get("percent_change_24h") is not None or r.get("percent_change_6h") is not None]
-    if resolved_any:
-        best = max(resolved_any, key=_pct)
-        pct = _pct(best)
-        if pct > 0:
-            best_call = {"ticker": best["ticker"], "pct": round(pct, 2), "signal": best["signal"]}
-
-    # ── Option P&L stats ────────────────────────────────────────────────────────
-    def _opt_return(r: dict) -> float:
-        for col in ("option_return_7d", "option_return_24h", "option_return_6h"):
-            v = r.get(col)
-            if v is not None:
-                return v
-        return 0.0
-
-    def _opt_profit(r: dict) -> float | None:
-        cost = r.get("option_cost")
-        for val_col, profit_col in [
-            ("option_value_7d", "option_profit_7d"),
-            ("option_value_24h", "option_profit_24h"),
-            ("option_value_6h", "option_profit_6h"),
-        ]:
-            stored = r.get(profit_col)
-            if stored is not None:
-                return stored
-            val = r.get(val_col)
-            if val is not None and cost is not None:
-                return val - cost
-        return None
-
-    resolved_opts = [
-        r for r in rows
-        if any(r.get(c) is not None for c in ("option_return_6h", "option_return_24h", "option_return_7d"))
-    ]
-
-    best_option_return = None
-    if resolved_opts:
-        best_opt = max(resolved_opts, key=_opt_return)
-        opt_pct = _opt_return(best_opt)
-        best_option_return = {"ticker": best_opt["ticker"], "pct": round(opt_pct, 2), "signal": best_opt["signal"]}
-
-    avg_option_return = (
-        round(sum(_opt_return(r) for r in resolved_opts) / len(resolved_opts), 1)
-        if resolved_opts else None
-    )
-
-    opt_wins = sum(1 for r in resolved_opts if _opt_return(r) > 0)
-    option_win_rate = round(opt_wins / len(resolved_opts) * 100, 1) if resolved_opts else None
-
-    buy_opts  = [r for r in resolved_opts if r.get("signal") == "BUY"]
-    sell_opts = [r for r in resolved_opts if r.get("signal") == "SELL"]
-
-    def _sum_profit(group):
-        return round(sum(p for r in group for p in [_opt_profit(r)] if p is not None), 2)
-
-    total_buy_pnl      = _sum_profit(buy_opts)
-    total_sell_pnl     = _sum_profit(sell_opts)
-    total_combined_pnl = round(total_buy_pnl + total_sell_pnl, 2)
-
-    now = datetime.now(timezone.utc)
-
-    # Determine bot state from DB heartbeat, falling back to in-memory _last_run
-    bot_state = "offline"
-    minutes_since_heartbeat = None
-    minutes_until_next_run = None
-    last_updated = "Never"
-    last_run_duration = None
-    last_posts_collected = None
-    last_signals_generated = None
-
-    hb_str = None
-    if bot_status_row and bot_status_row.get("last_heartbeat"):
-        hb_str = bot_status_row["last_heartbeat"]
-    elif _last_run:
-        hb_str = _last_run.strftime("%Y-%m-%d %H:%M:%S")
-
-    if hb_str:
-        try:
-            hb = datetime.fromisoformat(hb_str).replace(tzinfo=timezone.utc)
-            age_mins = (now - hb).total_seconds() / 60
-            minutes_since_heartbeat = round(age_mins, 1)
-            minutes_until_next_run = max(0, round(SCHEDULE_INTERVAL_MINUTES - age_mins, 1))
-            last_updated = hb.strftime("%Y-%m-%d %H:%M UTC")
-            if age_mins < 20:
-                bot_state = "live"
-            elif age_mins < 60:
-                bot_state = "idle"
-            if bot_status_row:
-                last_run_duration = bot_status_row.get("last_run_duration")
-                last_posts_collected = bot_status_row.get("last_posts_collected")
-                last_signals_generated = bot_status_row.get("last_signals_generated")
+            rows = [dict(r) for r in conn.execute("SELECT * FROM performance").fetchall()]
+            try:
+                bot_row = conn.execute("SELECT * FROM bot_status WHERE id = 1").fetchone()
+                bot_status_row = dict(bot_row) if bot_row else None
+            except Exception:
+                pass
         except Exception:
             pass
+        finally:
+            conn.close()
+    except Exception:
+        pass
 
-    return jsonify({
-        "total_signals": total,
-        "win_rate_6h": win_rate_6h,
-        "win_rate_24h": win_rate_24h,
-        "best_call": best_call,
-        "last_updated": last_updated,
-        "bot_running": bot_state == "live",
-        "bot_state": bot_state,
-        "minutes_since_heartbeat": minutes_since_heartbeat,
-        "minutes_until_next_run": minutes_until_next_run,
-        "last_run_duration": last_run_duration,
-        "last_posts_collected": last_posts_collected,
-        "last_signals_generated": last_signals_generated,
-        "best_option_return": best_option_return,
-        "avg_option_return": avg_option_return,
-        "option_win_rate": option_win_rate,
-        "total_buy_pnl": total_buy_pnl,
-        "total_sell_pnl": total_sell_pnl,
-        "total_combined_pnl": total_combined_pnl,
-        "resolved_options_count": len(resolved_opts),
-    })
+    # ── Computation ─────────────────────────────────────────────────────────────
+    try:
+        total = len(rows)
+
+        resolved_6h = [r for r in rows if r.get("percent_change_6h") is not None]
+        wins_6h = sum(1 for r in resolved_6h if r.get("outcome_6h") == "WIN")
+        win_rate_6h = round(wins_6h / len(resolved_6h) * 100, 1) if resolved_6h else None
+
+        resolved_24h = [r for r in rows if r.get("percent_change_24h") is not None]
+        wins_24h = sum(1 for r in resolved_24h if r.get("outcome") == "WIN")
+        win_rate_24h = round(wins_24h / len(resolved_24h) * 100, 1) if resolved_24h else None
+
+        best_call = None
+        def _pct(r: dict) -> float:
+            return r.get("percent_change_24h") or r.get("percent_change_6h") or 0.0
+
+        resolved_any = [r for r in rows if r.get("percent_change_24h") is not None or r.get("percent_change_6h") is not None]
+        if resolved_any:
+            best = max(resolved_any, key=_pct)
+            pct = _pct(best)
+            if pct > 0:
+                best_call = {"ticker": best["ticker"], "pct": round(pct, 2), "signal": best["signal"]}
+
+        # ── Option P&L stats ────────────────────────────────────────────────────
+        def _opt_return(r: dict) -> float:
+            for col in ("option_return_7d", "option_return_24h", "option_return_6h"):
+                v = r.get(col)
+                if v is not None:
+                    return v
+            return 0.0
+
+        def _opt_profit(r: dict) -> float | None:
+            cost = r.get("option_cost")
+            for val_col, profit_col in [
+                ("option_value_7d", "option_profit_7d"),
+                ("option_value_24h", "option_profit_24h"),
+                ("option_value_6h", "option_profit_6h"),
+            ]:
+                stored = r.get(profit_col)
+                if stored is not None:
+                    return stored
+                val = r.get(val_col)
+                if val is not None and cost is not None:
+                    return val - cost
+            return None
+
+        resolved_opts = [
+            r for r in rows
+            if any(r.get(c) is not None for c in ("option_return_6h", "option_return_24h", "option_return_7d"))
+        ]
+
+        best_option_return = None
+        if resolved_opts:
+            best_opt = max(resolved_opts, key=_opt_return)
+            opt_pct = _opt_return(best_opt)
+            best_option_return = {"ticker": best_opt["ticker"], "pct": round(opt_pct, 2), "signal": best_opt["signal"]}
+
+        avg_option_return = (
+            round(sum(_opt_return(r) for r in resolved_opts) / len(resolved_opts), 1)
+            if resolved_opts else None
+        )
+
+        opt_wins = sum(1 for r in resolved_opts if _opt_return(r) > 0)
+        option_win_rate = round(opt_wins / len(resolved_opts) * 100, 1) if resolved_opts else None
+
+        buy_opts  = [r for r in resolved_opts if r.get("signal") == "BUY"]
+        sell_opts = [r for r in resolved_opts if r.get("signal") == "SELL"]
+
+        def _sum_profit(group):
+            return round(sum(p for r in group for p in [_opt_profit(r)] if p is not None), 2)
+
+        total_buy_pnl      = _sum_profit(buy_opts)
+        total_sell_pnl     = _sum_profit(sell_opts)
+        total_combined_pnl = round(total_buy_pnl + total_sell_pnl, 2)
+
+        now = datetime.now(timezone.utc)
+
+        # Determine bot state from DB heartbeat, falling back to in-memory _last_run
+        bot_state = "offline"
+        minutes_since_heartbeat = None
+        minutes_until_next_run = None
+        last_updated = "Never"
+        last_run_duration = None
+        last_posts_collected = None
+        last_signals_generated = None
+
+        hb_str = None
+        if bot_status_row and bot_status_row.get("last_heartbeat"):
+            hb_str = bot_status_row["last_heartbeat"]
+        elif _last_run:
+            hb_str = _last_run.strftime("%Y-%m-%d %H:%M:%S")
+
+        if hb_str:
+            try:
+                hb = datetime.fromisoformat(hb_str).replace(tzinfo=timezone.utc)
+                age_mins = (now - hb).total_seconds() / 60
+                minutes_since_heartbeat = round(age_mins, 1)
+                minutes_until_next_run = max(0, round(SCHEDULE_INTERVAL_MINUTES - age_mins, 1))
+                last_updated = hb.strftime("%Y-%m-%d %H:%M UTC")
+                if age_mins < 20:
+                    bot_state = "live"
+                elif age_mins < 60:
+                    bot_state = "idle"
+                if bot_status_row:
+                    last_run_duration = bot_status_row.get("last_run_duration")
+                    last_posts_collected = bot_status_row.get("last_posts_collected")
+                    last_signals_generated = bot_status_row.get("last_signals_generated")
+            except Exception:
+                pass
+
+        return jsonify({
+            "total_signals": total,
+            "win_rate_6h": win_rate_6h,
+            "win_rate_24h": win_rate_24h,
+            "best_call": best_call,
+            "last_updated": last_updated,
+            "bot_running": bot_state == "live",
+            "bot_state": bot_state,
+            "minutes_since_heartbeat": minutes_since_heartbeat,
+            "minutes_until_next_run": minutes_until_next_run,
+            "last_run_duration": last_run_duration,
+            "last_posts_collected": last_posts_collected,
+            "last_signals_generated": last_signals_generated,
+            "best_option_return": best_option_return,
+            "avg_option_return": avg_option_return,
+            "option_win_rate": option_win_rate,
+            "total_buy_pnl": total_buy_pnl,
+            "total_sell_pnl": total_sell_pnl,
+            "total_combined_pnl": total_combined_pnl,
+            "resolved_options_count": len(resolved_opts),
+        })
+    except Exception:
+        return jsonify({
+            "error": "stats computation failed", "total_signals": 0,
+            "bot_state": "offline", "bot_running": False,
+            "last_updated": "Error",
+        })
 
 
 @app.route("/api/performance")
@@ -311,16 +324,19 @@ def api_prices():
 
     result = []
     for t in tickers:
-        curr = prices.get(t)
-        entry = entry_prices.get(t)
-        if curr is not None:
-            pct = round((curr - entry) / entry * 100, 2) if entry else None
-            result.append({
-                "ticker": t,
-                "price": round(curr, 2),
-                "change_pct": pct,
-                "entry_price": entry,
-            })
+        try:
+            curr = prices.get(t)
+            entry = entry_prices.get(t)
+            if curr is not None:
+                pct = round((curr - entry) / entry * 100, 2) if entry else None
+                result.append({
+                    "ticker": t,
+                    "price": round(curr, 2),
+                    "change_pct": pct,
+                    "entry_price": entry,
+                })
+        except Exception:
+            pass
 
     with _price_lock:
         _price_cache = result
@@ -1101,7 +1117,17 @@ function timeAgo(ts) {
 
 async function refreshStats() {
   const d = await get('/api/stats');
-  if (!d) return;
+  if (!d) {
+    const pill = document.getElementById('statusPill');
+    pill.classList.remove('idle');
+    pill.classList.add('offline');
+    document.getElementById('statusLabel').textContent = 'Offline';
+    ['mv0','mv1','mv2','mv3','mv4','mv5','mv6','mv7'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) { el.textContent = '—'; el.style.color = 'var(--text3)'; }
+    });
+    return;
+  }
 
   const pill = document.getElementById('statusPill');
   const lbl  = document.getElementById('statusLabel');
@@ -1273,7 +1299,12 @@ async function refreshStats() {
 
 async function refreshPerf() {
   const rows = await get('/api/performance');
-  if (!rows) return;
+  if (!rows) {
+    document.getElementById('perfBadge').textContent = 'Error';
+    document.getElementById('perfBody').innerHTML =
+      '<tr><td colspan="12" class="empty-cell" style="color:var(--red)">Could not load performance data — server may be offline.</td></tr>';
+    return;
+  }
 
   document.getElementById('perfBadge').textContent = rows.length + ' record' + (rows.length !== 1 ? 's' : '');
 
@@ -1284,10 +1315,23 @@ async function refreshPerf() {
   }
 
   tbody.innerHTML = rows.map((r, i) => {
-    const out24 = r.outcome || 'PENDING';
-    const out6  = r.outcome_6h || 'PENDING';
-    const eff   = out24 !== 'PENDING' ? out24 : out6;
-    const trCls = eff === 'WIN' ? 't-win' : eff === 'LOSS' ? 't-loss' : 't-pending';
+    // Stock outcome
+    const stockOut24 = r.outcome     || 'PENDING';
+    const stockOut6  = r.outcome_6h  || 'PENDING';
+    const stockEff   = stockOut24 !== 'PENDING' ? stockOut24 : stockOut6;
+
+    // Best available option return: prefer 7d > 24h > 6h
+    const optRet  = r.option_return_7d  ?? r.option_return_24h  ?? r.option_return_6h;
+    const optVal  = r.option_value_7d   ?? r.option_value_24h   ?? r.option_value_6h;
+    const optCost = r.option_cost;
+    const optSrc  = r.option_price_source;
+
+    // Option outcome is based on option return, not stock move
+    const optEff = optRet == null ? 'PENDING' : optRet > 0 ? 'WIN' : 'LOSS';
+
+    // Row coloring uses option outcome when options exist, else stock outcome
+    const eff    = r.option_contract ? optEff : stockEff;
+    const trCls  = eff === 'WIN' ? 't-win' : eff === 'LOSS' ? 't-loss' : 't-pending';
 
     const dirBadge = r.signal === 'BUY'
       ? '<span class="b b-buy">BUY</span>'
@@ -1301,15 +1345,15 @@ async function refreshPerf() {
       ? '<span class="b b-loss">LOSS</span>'
       : '<span class="b b-pending">PENDING</span>';
 
+    // Separate stock outcome label shown below the main badge
+    const stockBadge = r.option_contract
+      ? `<small class="neu" style="display:block;margin-top:2px;font-size:10px;opacity:.7">Stock: ${stockEff}</small>`
+      : '';
+
     const opt = r.option_contract
       ? `<span title="${r.option_contract}">${r.option_type || '?'}&nbsp;$${r.option_strike || '?'}</span>`
       : '<span class="neu">—</span>';
 
-    // Best available option return: prefer 7d > 24h > 6h
-    const optRet = r.option_return_7d ?? r.option_return_24h ?? r.option_return_6h;
-    const optVal = r.option_value_7d  ?? r.option_value_24h  ?? r.option_value_6h;
-    const optCost = r.option_cost;
-    const optSrc  = r.option_price_source;
     let optRetHtml = '<span class="neu">—</span>';
     if (optRet != null && optCost != null) {
       const profit = optVal != null ? optVal - optCost : null;
@@ -1329,9 +1373,21 @@ async function refreshPerf() {
       optRetHtml = str;
     }
 
+    // Tooltip
+    const stockPct   = r.percent_change_6h ?? r.percent_change_24h ?? r.percent_change_7d;
+    const ttStockPct = stockPct != null ? (stockPct >= 0 ? '+' : '') + stockPct.toFixed(2) + '%' : 'N/A';
+    const ttOptCost  = optCost  != null ? '$' + optCost.toFixed(2)  : 'N/A';
+    const ttOptVal   = optVal   != null ? '$' + optVal.toFixed(2)   : 'N/A';
+    const ttOptRet   = optRet   != null ? (optRet >= 0 ? '+' : '') + optRet.toFixed(1) + '%' : 'N/A';
+    const profit     = (optVal != null && optCost != null) ? optVal - optCost : null;
+    const ttProfit   = profit   != null ? (profit >= 0 ? '+$' : '-$') + Math.abs(profit).toFixed(2) : 'N/A';
+    const ttLines    = r.option_contract
+      ? ['Stock move: ' + ttStockPct, 'Option entry cost: ' + ttOptCost, 'Option current value: ' + ttOptVal, 'Option return: ' + ttOptRet, 'Option P&L: ' + ttProfit].join('\\n')
+      : 'Stock move: ' + ttStockPct;
+
     const tk = (r.ticker || '').replace(/[^A-Z0-9.]/g, '');
 
-    return `<tr class="${trCls}" style="animation-delay:${Math.min(i * 15, 300)}ms">
+    return `<tr class="${trCls}" title="${ttLines.replace(/"/g, '&quot;')}" style="animation-delay:${Math.min(i * 15, 300)}ms">
       <td><span class="ticker-name">${r.ticker}</span></td>
       <td>${dirBadge}</td>
       <td class="mono">${fmt$(r.price_at_signal)}</td>
@@ -1343,14 +1399,18 @@ async function refreshPerf() {
       <td class="mono">${opt}</td>
       <td class="mono">${fmtIV(r.option_iv)}</td>
       <td class="mono">${optRetHtml}</td>
-      <td>${outBadge}</td>
+      <td>${outBadge}${stockBadge}</td>
     </tr>`;
   }).join('');
 }
 
 async function refreshOptions() {
   const data = await get('/api/options');
-  if (!data) return;
+  if (!data) {
+    document.getElementById('optRecs').innerHTML = '<p class="empty" style="color:var(--red)">Could not load — server may be offline</p>';
+    document.getElementById('ivWarn').innerHTML  = '<p class="empty" style="color:var(--red)">Could not load — server may be offline</p>';
+    return;
+  }
 
   const recs  = data.recommendations || [];
   const warns = data.iv_warnings || [];
@@ -1416,7 +1476,10 @@ async function refreshOptions() {
 
 async function refreshSignals() {
   const sigs = await get('/api/signals');
-  if (!sigs) return;
+  if (!sigs) {
+    document.getElementById('sigFeed').innerHTML = '<p class="empty" style="color:var(--red)">Could not load signals — server may be offline</p>';
+    return;
+  }
 
   const feed = document.getElementById('sigFeed');
   document.getElementById('sigBadge').textContent = sigs.length + ' recent';

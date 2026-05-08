@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(python -c ' *)",
-      "Bash(python *)"
+      "Bash(python *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\Liam\\\\wsb-bot\" -Recurse -Filter \"*.py\")",
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(echo \"EXIT:$?\")",
+      "Bash(netstat -ano)",
+      "Bash(findstr \":5000\")",
+      "Bash(findstr \"LISTENING\")",
+      "Bash(Select-String \":5000.*LISTEN\")",
+      "Bash(grep -v \"innerHTML\\\\|#\\\\|//\")"
     ]
   }
 }
