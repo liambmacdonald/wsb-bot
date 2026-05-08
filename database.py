@@ -21,6 +21,15 @@ logger = logging.getLogger(__name__)
 # ── Schema ─────────────────────────────────────────────────────────────────────
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS bot_status (
+    id                      INTEGER PRIMARY KEY CHECK (id = 1),
+    last_heartbeat          TEXT,
+    last_run_duration       REAL,
+    last_posts_collected    INTEGER,
+    last_signals_generated  INTEGER,
+    status                  TEXT DEFAULT 'offline'
+);
+
 CREATE TABLE IF NOT EXISTS performance (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     ticker              TEXT NOT NULL,
@@ -127,7 +136,22 @@ def init_db() -> None:
         _migrate_performance_6h(conn)
         _migrate_performance_options(conn)
         _migrate_performance_options_tracking(conn)
+        _migrate_bot_status(conn)
     logger.info("Database initialised at '%s'", DB_PATH)
+
+
+def _migrate_bot_status(conn: sqlite3.Connection) -> None:
+    """Create bot_status table if it doesn't exist (for pre-existing DBs)."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS bot_status (
+            id                      INTEGER PRIMARY KEY CHECK (id = 1),
+            last_heartbeat          TEXT,
+            last_run_duration       REAL,
+            last_posts_collected    INTEGER,
+            last_signals_generated  INTEGER,
+            status                  TEXT DEFAULT 'offline'
+        );
+    """)
 
 
 def _migrate_performance_6h(conn: sqlite3.Connection) -> None:
@@ -541,3 +565,41 @@ def get_pipeline_stats() -> dict:
         "total_signals":  total_signals,
         "total_trades":   total_trades,
     }
+
+
+# ── Bot heartbeat ──────────────────────────────────────────────────────────────
+
+def write_heartbeat(
+    duration_seconds: float,
+    posts_collected: int,
+    signals_generated: int,
+    status: str = "running",
+) -> None:
+    sql = """
+        INSERT INTO bot_status
+            (id, last_heartbeat, last_run_duration, last_posts_collected,
+             last_signals_generated, status)
+        VALUES (1, datetime('now'), ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            last_heartbeat         = excluded.last_heartbeat,
+            last_run_duration      = excluded.last_run_duration,
+            last_posts_collected   = excluded.last_posts_collected,
+            last_signals_generated = excluded.last_signals_generated,
+            status                 = excluded.status
+    """
+    try:
+        with _connect() as conn:
+            conn.execute(sql, (duration_seconds, posts_collected, signals_generated, status))
+        logger.debug("Heartbeat written (duration=%.1fs)", duration_seconds)
+    except Exception as exc:
+        logger.error("write_heartbeat failed: %s", exc)
+
+
+def get_bot_status() -> dict | None:
+    try:
+        with _connect() as conn:
+            row = conn.execute("SELECT * FROM bot_status WHERE id = 1").fetchone()
+            return dict(row) if row else None
+    except Exception as exc:
+        logger.error("get_bot_status failed: %s", exc)
+        return None

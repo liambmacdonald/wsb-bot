@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import yfinance as yf
 from flask import Flask, jsonify, Response
 
-from config import DB_PATH
+from config import DB_PATH, SCHEDULE_INTERVAL_MINUTES
 
 app = Flask(__name__)
 _last_run: datetime | None = None
@@ -65,8 +65,14 @@ def api_stats():
     conn = _db()
     try:
         rows = [dict(r) for r in conn.execute("SELECT * FROM performance").fetchall()]
+        try:
+            bot_row = conn.execute("SELECT * FROM bot_status WHERE id = 1").fetchone()
+            bot_status_row = dict(bot_row) if bot_row else None
+        except Exception:
+            bot_status_row = None
     except Exception:
         rows = []
+        bot_status_row = None
     finally:
         conn.close()
 
@@ -92,8 +98,39 @@ def api_stats():
             best_call = {"ticker": best["ticker"], "pct": round(pct, 2), "signal": best["signal"]}
 
     now = datetime.now(timezone.utc)
-    last_updated = _last_run.strftime("%Y-%m-%d %H:%M UTC") if _last_run else "Never"
-    bot_running = _last_run is not None and (now - _last_run).total_seconds() < 3600
+
+    # Determine bot state from DB heartbeat, falling back to in-memory _last_run
+    bot_state = "offline"
+    minutes_since_heartbeat = None
+    minutes_until_next_run = None
+    last_updated = "Never"
+    last_run_duration = None
+    last_posts_collected = None
+    last_signals_generated = None
+
+    hb_str = None
+    if bot_status_row and bot_status_row.get("last_heartbeat"):
+        hb_str = bot_status_row["last_heartbeat"]
+    elif _last_run:
+        hb_str = _last_run.strftime("%Y-%m-%d %H:%M:%S")
+
+    if hb_str:
+        try:
+            hb = datetime.fromisoformat(hb_str).replace(tzinfo=timezone.utc)
+            age_mins = (now - hb).total_seconds() / 60
+            minutes_since_heartbeat = round(age_mins, 1)
+            minutes_until_next_run = max(0, round(SCHEDULE_INTERVAL_MINUTES - age_mins, 1))
+            last_updated = hb.strftime("%Y-%m-%d %H:%M UTC")
+            if age_mins < 20:
+                bot_state = "live"
+            elif age_mins < 60:
+                bot_state = "idle"
+            if bot_status_row:
+                last_run_duration = bot_status_row.get("last_run_duration")
+                last_posts_collected = bot_status_row.get("last_posts_collected")
+                last_signals_generated = bot_status_row.get("last_signals_generated")
+        except Exception:
+            pass
 
     return jsonify({
         "total_signals": total,
@@ -101,7 +138,13 @@ def api_stats():
         "win_rate_24h": win_rate_24h,
         "best_call": best_call,
         "last_updated": last_updated,
-        "bot_running": bot_running,
+        "bot_running": bot_state == "live",
+        "bot_state": bot_state,
+        "minutes_since_heartbeat": minutes_since_heartbeat,
+        "minutes_until_next_run": minutes_until_next_run,
+        "last_run_duration": last_run_duration,
+        "last_posts_collected": last_posts_collected,
+        "last_signals_generated": last_signals_generated,
     })
 
 
@@ -367,6 +410,15 @@ body{
   background:var(--red);
   animation:none;
 }
+.status-pill.idle{
+  background:rgba(255,214,10,0.1);
+  border-color:rgba(255,214,10,0.22);
+  color:var(--yellow);
+}
+.status-pill.idle .status-dot{
+  background:var(--yellow);
+  animation:none;
+}
 @keyframes pulse{
   0%,100%{opacity:1;transform:scale(1)}
   50%{opacity:.5;transform:scale(.7)}
@@ -375,6 +427,12 @@ body{
   font-size:12px;
   color:var(--text3);
   font-variant-numeric:tabular-nums;
+  letter-spacing:0.01em;
+}
+.nav-stat{
+  font-size:11px;
+  color:var(--text3);
+  white-space:nowrap;
   letter-spacing:0.01em;
 }
 
@@ -743,6 +801,9 @@ body{
     </div>
   </div>
   <div class="nav-right">
+    <span class="nav-stat" id="navLastRun"></span>
+    <span class="nav-stat" id="navNextRun"></span>
+    <span class="nav-stat" id="navRunStats"></span>
     <div class="prices-live">
       <div class="pl-dot" id="plDot"></div>
       <span>Prices live</span>
@@ -894,13 +955,32 @@ async function refreshStats() {
 
   const pill = document.getElementById('statusPill');
   const lbl  = document.getElementById('statusLabel');
-  if (d.bot_running) {
-    pill.classList.remove('offline');
+  pill.classList.remove('offline', 'idle');
+  if (d.bot_state === 'live') {
     lbl.textContent = 'Live';
+  } else if (d.bot_state === 'idle') {
+    pill.classList.add('idle');
+    lbl.textContent = 'Idle';
   } else {
     pill.classList.add('offline');
-    lbl.textContent = 'Idle';
+    lbl.textContent = 'Offline';
   }
+
+  if (d.minutes_since_heartbeat != null) {
+    const m = d.minutes_since_heartbeat;
+    document.getElementById('navLastRun').textContent =
+      'Last run: ' + (m < 1 ? 'just now' : Math.round(m) + 'm ago');
+  }
+  if (d.minutes_until_next_run != null) {
+    const n = d.minutes_until_next_run;
+    document.getElementById('navNextRun').textContent =
+      'Next: ' + (n < 1 ? '<1m' : Math.round(n) + 'm');
+  }
+  if (d.last_posts_collected != null || d.last_signals_generated != null) {
+    document.getElementById('navRunStats').textContent =
+      (d.last_posts_collected ?? '—') + ' posts · ' + (d.last_signals_generated ?? '—') + ' signals';
+  }
+
   document.getElementById('navTime').textContent = d.last_updated || '—';
 
   document.getElementById('mv0').textContent = d.total_signals ?? '—';

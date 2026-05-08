@@ -23,7 +23,7 @@ from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED
 
 import config
 from config import setup_logging, validate_config, SCHEDULE_INTERVAL_MINUTES
-from database import init_db, save_post, analysis_exists, save_analysis, get_pipeline_stats
+from database import init_db, save_post, analysis_exists, save_analysis, get_pipeline_stats, write_heartbeat
 from collector import collect_posts, collect_discussion_comments
 from analyzer import analyze_posts
 from signals import generate_signals
@@ -142,6 +142,7 @@ def run_pipeline() -> None:
     )
     logger.info("Pipeline run complete in %.1fs", run_duration)
 
+    write_heartbeat(run_duration, posts_collected, len(signals))
     dashboard.set_last_run()
     print_performance_summary()
 
