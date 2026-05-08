@@ -4,6 +4,7 @@ Fetches live options chain data via yfinance.
 """
 
 import logging
+import math
 from datetime import datetime
 
 import pandas as pd
@@ -21,6 +22,21 @@ _MIN_OI         = 100
 _MIN_BID        = 0.10
 _IV_HIGH_THRESH    = 0.60
 _IV_EXTREME_THRESH = 0.80
+
+
+def _norm_cdf(x: float) -> float:
+    return (1.0 + math.erf(x / math.sqrt(2))) / 2.0
+
+
+def _bs_delta(S: float, K: float, T_years: float, iv: float, option_type: str) -> float | None:
+    """Black-Scholes delta (risk-free rate = 0). Returns None on bad inputs."""
+    if T_years <= 0 or iv <= 0 or S <= 0 or K <= 0:
+        return None
+    try:
+        d1 = (math.log(S / K) + 0.5 * iv ** 2 * T_years) / (iv * math.sqrt(T_years))
+        return _norm_cdf(d1) if option_type == "CALL" else _norm_cdf(d1) - 1.0
+    except Exception:
+        return None
 
 
 def _nearest_expiry(expirations: tuple[str, ...], now: datetime) -> str | None:
@@ -148,6 +164,13 @@ def get_options_recommendation(
 
     raw_delta = contract.get("delta")
     delta     = float(raw_delta) if raw_delta is not None else None
+    if delta is None:
+        try:
+            days_to_expiry = (datetime.strptime(expiry, "%Y-%m-%d") - datetime.utcnow()).days
+        except ValueError:
+            days_to_expiry = 0
+        T = max(days_to_expiry, 1) / 365.0
+        delta = _bs_delta(current_price, strike, T, iv, option_type)
 
     mid      = (bid + ask) / 2 if bid > 0 and ask > 0 else last_price
     cost     = round(mid * 100, 2)
