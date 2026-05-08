@@ -358,8 +358,8 @@ def collect_discussion_comments() -> list[dict]:
     Returns:
         List of comment dicts in the same format as collect_posts items.
     """
-    _MAX_PASSED = 500
-    _MAX_BATCHES = 10
+    _MAX_PASSED = 2000
+    _MAX_BATCHES = 50
 
     post = _find_daily_discussion()
     if post is None:
@@ -405,9 +405,9 @@ def collect_discussion_comments() -> list[dict]:
 
     print(f"\n[DEBUG] Daily discussion '{post['title']}':")
     print(f"  Comments fetched (initial)  : {initial_count}")
-    print(f"  Additional batches fetched  : {batches_fetched}")
+    print(f"  Additional batches fetched  : {batches_fetched} / {_MAX_BATCHES}")
     print(f"  Total raw comments seen     : {total_raw:,}")
-    print(f"  Comments passed filters     : {len(passed)}")
+    print(f"  Comments passed filters     : {len(passed)} / {_MAX_PASSED}")
 
     logger.info(
         "collect_discussion_comments: %d initial + %d batches → %d raw → %d passed filters",
