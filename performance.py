@@ -12,7 +12,6 @@ from datetime import datetime, timedelta
 
 import yfinance as yf
 
-from options import estimate_option_return
 from database import (
     get_all_pending_rows,
     get_pending_6h_rows,
@@ -75,20 +74,24 @@ def _outcome(signal: str, pct_change: float) -> str:
     return "WIN" if pct_change < 0 else "LOSS"   # SELL wins when price drops
 
 
-def _option_perf(row: dict, stock_pct: float) -> tuple[float | None, float | None, str | None]:
-    """Return (option_value, option_return_pct, option_outcome) for a checkpoint.
-    Returns (None, None, None) when the row has no options data."""
+def _option_perf(row: dict, current_price: float) -> tuple[float | None, float | None, float | None, str | None]:
+    """Return (option_value, option_return_pct, option_profit, option_outcome).
+    Returns (None, None, None, None) when the row has no options data."""
     strike   = row.get("option_strike")
     cost     = row.get("option_cost")
     opt_type = row.get("option_type")
-    entry    = row.get("price_at_signal")
-    if not all([strike, cost, opt_type, entry]):
-        return None, None, None
-    mid = cost / 100.0
-    ret = estimate_option_return(entry, strike, mid, stock_pct / 100.0, opt_type)
-    value   = 0.0 if ret <= -99.9 else round(mid * (1 + ret / 100.0) * 100, 2)
-    outcome = "WIN" if ret > 0 else "LOSS"
-    return value, round(ret, 4), outcome
+    if not (strike and cost and opt_type and cost > 0):
+        return None, None, None, None
+
+    if opt_type == "CALL":
+        option_value = max(0.0, current_price - strike) * 100
+    else:
+        option_value = max(0.0, strike - current_price) * 100
+
+    option_return = ((option_value - cost) / cost) * 100
+    option_profit = option_value - cost
+    outcome = "WIN" if option_profit > 0 else "LOSS"
+    return round(option_value, 2), round(option_return, 4), round(option_profit, 2), outcome
 
 
 # ── Public: update ────────────────────────────────────────────────────────────
@@ -130,9 +133,9 @@ def update_performance() -> None:
         if price is None:
             continue
         pct = (price - row["price_at_signal"]) / row["price_at_signal"] * 100
-        opt_val, opt_ret, opt_out = _option_perf(row, pct)
+        opt_val, opt_ret, opt_profit, opt_out = _option_perf(row, price)
         update_performance_6h(row["id"], price, pct, _outcome(row["signal"], pct),
-                               opt_val, opt_ret, opt_out)
+                               opt_val, opt_ret, opt_profit, opt_out)
         updated_6h += 1
         logger.info(
             "6h update: %s %s  entry=%.2f  now=%.2f  pct=%.2f%%",
@@ -144,9 +147,9 @@ def update_performance() -> None:
         if price is None:
             continue
         pct = (price - row["price_at_signal"]) / row["price_at_signal"] * 100
-        opt_val, opt_ret, opt_out = _option_perf(row, pct)
+        opt_val, opt_ret, opt_profit, opt_out = _option_perf(row, price)
         update_performance_24h(row["id"], price, pct, _outcome(row["signal"], pct),
-                                opt_val, opt_ret, opt_out)
+                                opt_val, opt_ret, opt_profit, opt_out)
         updated_24h += 1
         logger.info(
             "24h update: %s %s  entry=%.2f  now=%.2f  pct=%.2f%%",
@@ -158,9 +161,9 @@ def update_performance() -> None:
         if price is None:
             continue
         pct = (price - row["price_at_signal"]) / row["price_at_signal"] * 100
-        opt_val, opt_ret, opt_out = _option_perf(row, pct)
+        opt_val, opt_ret, opt_profit, opt_out = _option_perf(row, price)
         update_performance_7d(row["id"], price, pct, _outcome(row["signal"], pct),
-                               opt_val, opt_ret, opt_out)
+                               opt_val, opt_ret, opt_profit, opt_out)
         updated_7d += 1
         logger.info(
             "7d update: %s %s  entry=%.2f  now=%.2f  pct=%.2f%%",

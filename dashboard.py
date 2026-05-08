@@ -97,6 +97,58 @@ def api_stats():
         if pct > 0:
             best_call = {"ticker": best["ticker"], "pct": round(pct, 2), "signal": best["signal"]}
 
+    # ── Option P&L stats ────────────────────────────────────────────────────────
+    def _opt_return(r: dict) -> float:
+        for col in ("option_return_7d", "option_return_24h", "option_return_6h"):
+            v = r.get(col)
+            if v is not None:
+                return v
+        return 0.0
+
+    def _opt_profit(r: dict) -> float | None:
+        cost = r.get("option_cost")
+        for val_col, profit_col in [
+            ("option_value_7d", "option_profit_7d"),
+            ("option_value_24h", "option_profit_24h"),
+            ("option_value_6h", "option_profit_6h"),
+        ]:
+            stored = r.get(profit_col)
+            if stored is not None:
+                return stored
+            val = r.get(val_col)
+            if val is not None and cost is not None:
+                return val - cost
+        return None
+
+    resolved_opts = [
+        r for r in rows
+        if any(r.get(c) is not None for c in ("option_return_6h", "option_return_24h", "option_return_7d"))
+    ]
+
+    best_option_return = None
+    if resolved_opts:
+        best_opt = max(resolved_opts, key=_opt_return)
+        opt_pct = _opt_return(best_opt)
+        best_option_return = {"ticker": best_opt["ticker"], "pct": round(opt_pct, 2), "signal": best_opt["signal"]}
+
+    avg_option_return = (
+        round(sum(_opt_return(r) for r in resolved_opts) / len(resolved_opts), 1)
+        if resolved_opts else None
+    )
+
+    opt_wins = sum(1 for r in resolved_opts if _opt_return(r) > 0)
+    option_win_rate = round(opt_wins / len(resolved_opts) * 100, 1) if resolved_opts else None
+
+    buy_opts  = [r for r in resolved_opts if r.get("signal") == "BUY"]
+    sell_opts = [r for r in resolved_opts if r.get("signal") == "SELL"]
+
+    def _sum_profit(group):
+        return round(sum(p for r in group for p in [_opt_profit(r)] if p is not None), 2)
+
+    total_buy_pnl      = _sum_profit(buy_opts)
+    total_sell_pnl     = _sum_profit(sell_opts)
+    total_combined_pnl = round(total_buy_pnl + total_sell_pnl, 2)
+
     now = datetime.now(timezone.utc)
 
     # Determine bot state from DB heartbeat, falling back to in-memory _last_run
@@ -145,6 +197,13 @@ def api_stats():
         "last_run_duration": last_run_duration,
         "last_posts_collected": last_posts_collected,
         "last_signals_generated": last_signals_generated,
+        "best_option_return": best_option_return,
+        "avg_option_return": avg_option_return,
+        "option_win_rate": option_win_rate,
+        "total_buy_pnl": total_buy_pnl,
+        "total_sell_pnl": total_sell_pnl,
+        "total_combined_pnl": total_combined_pnl,
+        "resolved_options_count": len(resolved_opts),
     })
 
 
@@ -685,6 +744,42 @@ body{
 .dn{color:var(--red)}
 .neu{color:var(--text3)}
 
+/* ── Options P&L summary ──────────────────────────────────────────────────── */
+.pnl-grid{
+  display:grid;
+  grid-template-columns:repeat(4,1fr);
+  gap:14px;
+}
+.pnl-item{
+  background:rgba(255,255,255,0.03);
+  border:1px solid var(--border);
+  border-radius:var(--rs);
+  padding:18px 20px;
+  text-align:center;
+}
+.pnl-label{
+  font-size:10px;
+  font-weight:600;
+  letter-spacing:.09em;
+  text-transform:uppercase;
+  color:var(--text3);
+  margin-bottom:8px;
+}
+.pnl-value{
+  font-size:26px;
+  font-weight:300;
+  font-variant-numeric:tabular-nums;
+  letter-spacing:-0.5px;
+  line-height:1;
+}
+.pnl-sub{
+  font-size:10px;
+  color:var(--text3);
+  margin-top:5px;
+}
+@media(max-width:960px){.pnl-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:540px){.pnl-grid{grid-template-columns:1fr}}
+
 /* ── Options grid ─────────────────────────────────────────────────────────── */
 .options-grid{
   display:grid;
@@ -822,7 +917,7 @@ body{
 <!-- Main -->
 <main class="main">
 
-  <!-- Metric cards -->
+  <!-- Metric cards row 1: signal performance -->
   <div class="metrics-row">
     <div class="metric-card c-blue" id="mc0">
       <div class="metric-label">Total Signals</div>
@@ -846,6 +941,30 @@ body{
     </div>
   </div>
 
+  <!-- Metric cards row 2: option performance -->
+  <div class="metrics-row">
+    <div class="metric-card c-blue" id="mc4">
+      <div class="metric-label">Best Option Return</div>
+      <div class="metric-value" id="mv4">—</div>
+      <div class="metric-sub" id="ms4">top contract</div>
+    </div>
+    <div class="metric-card c-blue" id="mc5">
+      <div class="metric-label">Avg Option Return</div>
+      <div class="metric-value" id="mv5">—</div>
+      <div class="metric-sub" id="ms5">resolved contracts</div>
+    </div>
+    <div class="metric-card c-blue" id="mc6">
+      <div class="metric-label">Option Win Rate</div>
+      <div class="metric-value" id="mv6">—</div>
+      <div class="metric-sub" id="ms6">profitable contracts</div>
+    </div>
+    <div class="metric-card c-blue" id="mc7">
+      <div class="metric-label">Combined P&amp;L</div>
+      <div class="metric-value" id="mv7">—</div>
+      <div class="metric-sub" id="ms7">1 contract each</div>
+    </div>
+  </div>
+
   <!-- Performance table -->
   <div class="card">
     <div class="card-head">
@@ -866,11 +985,12 @@ body{
             <th>7d</th>
             <th>Option</th>
             <th>IV</th>
+            <th>Opt Return</th>
             <th>Outcome</th>
           </tr>
         </thead>
         <tbody id="perfBody">
-          <tr><td colspan="11" class="empty-cell">Loading performance data…</td></tr>
+          <tr><td colspan="12" class="empty-cell">Loading performance data…</td></tr>
         </tbody>
       </table>
     </div>
@@ -902,6 +1022,36 @@ body{
     </div>
     <div class="signal-wrap" id="sigFeed">
       <p class="empty">Loading signals…</p>
+    </div>
+  </div>
+
+  <!-- Options P&L Summary -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-title">Options P&amp;L Summary</span>
+      <span class="card-badge">1 contract per signal</span>
+    </div>
+    <div class="pnl-grid" id="pnlGrid">
+      <div class="pnl-item">
+        <div class="pnl-label">BUY Signals P&amp;L</div>
+        <div class="pnl-value" id="pnlBuy">—</div>
+        <div class="pnl-sub" id="pnlBuySub">no data</div>
+      </div>
+      <div class="pnl-item">
+        <div class="pnl-label">SELL Signals P&amp;L</div>
+        <div class="pnl-value" id="pnlSell">—</div>
+        <div class="pnl-sub" id="pnlSellSub">no data</div>
+      </div>
+      <div class="pnl-item">
+        <div class="pnl-label">Combined P&amp;L</div>
+        <div class="pnl-value" id="pnlCombined">—</div>
+        <div class="pnl-sub" id="pnlCombinedSub">all signals</div>
+      </div>
+      <div class="pnl-item">
+        <div class="pnl-label">Options Win Rate</div>
+        <div class="pnl-value" id="pnlWinRate">—</div>
+        <div class="pnl-sub" id="pnlWinRateSub">resolved contracts</div>
+      </div>
     </div>
   </div>
 
@@ -1020,6 +1170,105 @@ async function refreshStats() {
     ms3.textContent = 'no resolved signals';
     mc3.className = 'metric-card c-blue';
   }
+
+  // ── Option metric cards ──────────────────────────────────────────────────────
+  const mc4 = document.getElementById('mc4');
+  const mv4 = document.getElementById('mv4');
+  const ms4 = document.getElementById('ms4');
+  if (d.best_option_return) {
+    const sign = d.best_option_return.pct > 0 ? '+' : '';
+    mv4.textContent = d.best_option_return.ticker;
+    ms4.textContent = sign + d.best_option_return.pct + '%  ' + d.best_option_return.signal;
+    mc4.className = 'metric-card ' + (d.best_option_return.pct > 0 ? 'c-green' : 'c-red');
+  } else {
+    mv4.textContent = 'N/A';
+    ms4.textContent = 'no resolved contracts';
+    mc4.className = 'metric-card c-blue';
+  }
+
+  const mc5 = document.getElementById('mc5');
+  const mv5 = document.getElementById('mv5');
+  const ms5 = document.getElementById('ms5');
+  if (d.avg_option_return != null) {
+    const sign = d.avg_option_return > 0 ? '+' : '';
+    mv5.textContent = sign + d.avg_option_return + '%';
+    ms5.textContent = (d.resolved_options_count || 0) + ' contracts';
+    mc5.className = 'metric-card ' + (d.avg_option_return >= 0 ? 'c-green' : 'c-red');
+  } else {
+    mv5.textContent = 'N/A';
+    ms5.textContent = 'no resolved contracts';
+    mc5.className = 'metric-card c-blue';
+  }
+
+  const mc6 = document.getElementById('mc6');
+  const mv6 = document.getElementById('mv6');
+  const ms6 = document.getElementById('ms6');
+  if (d.option_win_rate != null) {
+    mv6.textContent = d.option_win_rate + '%';
+    ms6.textContent = 'options only';
+    mc6.className = 'metric-card ' + (d.option_win_rate >= 50 ? 'c-green' : 'c-red');
+  } else {
+    mv6.textContent = 'N/A';
+    ms6.textContent = 'no resolved contracts';
+    mc6.className = 'metric-card c-blue';
+  }
+
+  const mc7 = document.getElementById('mc7');
+  const mv7 = document.getElementById('mv7');
+  const ms7 = document.getElementById('ms7');
+  if (d.total_combined_pnl != null && d.resolved_options_count > 0) {
+    const pnl = d.total_combined_pnl;
+    mv7.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(0);
+    ms7.textContent = '1 contract each';
+    mc7.className = 'metric-card ' + (pnl >= 0 ? 'c-green' : 'c-red');
+  } else {
+    mv7.textContent = 'N/A';
+    ms7.textContent = '1 contract each';
+    mc7.className = 'metric-card c-blue';
+  }
+
+  // ── Options P&L summary panel ────────────────────────────────────────────────
+  function fmtPnlValue(val, el, subEl, subText) {
+    if (val == null || val === 0 && !subText.includes('0')) {
+      el.textContent = '$0';
+      el.className = 'pnl-value neu';
+    } else {
+      el.textContent = (val >= 0 ? '+$' : '-$') + Math.abs(val).toFixed(0);
+      el.className = 'pnl-value ' + (val >= 0 ? 'up' : 'dn');
+    }
+    if (subEl && subText) subEl.textContent = subText;
+  }
+
+  fmtPnlValue(
+    d.total_buy_pnl,
+    document.getElementById('pnlBuy'),
+    document.getElementById('pnlBuySub'),
+    'if bought 1 contract each BUY'
+  );
+  fmtPnlValue(
+    d.total_sell_pnl,
+    document.getElementById('pnlSell'),
+    document.getElementById('pnlSellSub'),
+    'if bought 1 contract each SELL'
+  );
+  fmtPnlValue(
+    d.total_combined_pnl,
+    document.getElementById('pnlCombined'),
+    document.getElementById('pnlCombinedSub'),
+    'all signals combined'
+  );
+
+  const wrEl  = document.getElementById('pnlWinRate');
+  const wrSub = document.getElementById('pnlWinRateSub');
+  if (d.option_win_rate != null) {
+    wrEl.textContent = d.option_win_rate + '%';
+    wrEl.className   = 'pnl-value ' + (d.option_win_rate >= 50 ? 'up' : 'dn');
+    wrSub.textContent = (d.resolved_options_count || 0) + ' resolved';
+  } else {
+    wrEl.textContent = '—';
+    wrEl.className   = 'pnl-value neu';
+    wrSub.textContent = 'no data yet';
+  }
 }
 
 async function refreshPerf() {
@@ -1030,7 +1279,7 @@ async function refreshPerf() {
 
   const tbody = document.getElementById('perfBody');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="11" class="empty-cell">No performance data yet — run the bot to generate signals.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="12" class="empty-cell">No performance data yet — run the bot to generate signals.</td></tr>';
     return;
   }
 
@@ -1056,6 +1305,23 @@ async function refreshPerf() {
       ? `<span title="${r.option_contract}">${r.option_type || '?'}&nbsp;$${r.option_strike || '?'}</span>`
       : '<span class="neu">—</span>';
 
+    // Best available option return: prefer 7d > 24h > 6h
+    const optRet = r.option_return_7d ?? r.option_return_24h ?? r.option_return_6h;
+    const optVal = r.option_value_7d  ?? r.option_value_24h  ?? r.option_value_6h;
+    const optCost = r.option_cost;
+    let optRetHtml = '<span class="neu">—</span>';
+    if (optRet != null && optCost != null) {
+      const profit = optVal != null ? optVal - optCost : null;
+      const cls  = optRet >= 0 ? 'up' : 'dn';
+      const sign = optRet >= 0 ? '+' : '';
+      let str = `<span class="${cls}" style="white-space:nowrap">${sign}${optRet.toFixed(1)}%`;
+      if (profit != null) {
+        str += `<br><small>${profit >= 0 ? '+' : ''}$${Math.abs(profit).toFixed(0)}</small>`;
+      }
+      str += '</span>';
+      optRetHtml = str;
+    }
+
     const tk = (r.ticker || '').replace(/[^A-Z0-9.]/g, '');
 
     return `<tr class="${trCls}" style="animation-delay:${Math.min(i * 15, 300)}ms">
@@ -1069,6 +1335,7 @@ async function refreshPerf() {
       <td class="mono">${fmtPct(r.percent_change_7d)}</td>
       <td class="mono">${opt}</td>
       <td class="mono">${fmtIV(r.option_iv)}</td>
+      <td class="mono">${optRetHtml}</td>
       <td>${outBadge}</td>
     </tr>`;
   }).join('');

@@ -58,12 +58,15 @@ CREATE TABLE IF NOT EXISTS performance (
     option_breakeven    REAL,
     option_value_6h     REAL,
     option_return_6h    REAL,
+    option_profit_6h    REAL,
     option_outcome_6h   TEXT,
     option_value_24h    REAL,
     option_return_24h   REAL,
+    option_profit_24h   REAL,
     option_outcome_24h  TEXT,
     option_value_7d     REAL,
     option_return_7d    REAL,
+    option_profit_7d    REAL,
     option_outcome_7d   TEXT
 );
 
@@ -136,6 +139,7 @@ def init_db() -> None:
         _migrate_performance_6h(conn)
         _migrate_performance_options(conn)
         _migrate_performance_options_tracking(conn)
+        _migrate_performance_options_profit(conn)
         _migrate_bot_status(conn)
     logger.info("Database initialised at '%s'", DB_PATH)
 
@@ -200,6 +204,18 @@ def _migrate_performance_options_tracking(conn: sqlite3.Connection) -> None:
         ("option_value_7d",    "REAL"),
         ("option_return_7d",   "REAL"),
         ("option_outcome_7d",  "TEXT"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE performance ADD COLUMN {col} {defn}")
+
+
+def _migrate_performance_options_profit(conn: sqlite3.Connection) -> None:
+    """Add options profit tracking columns to an existing performance table."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(performance)").fetchall()}
+    for col, defn in [
+        ("option_profit_6h",  "REAL"),
+        ("option_profit_24h", "REAL"),
+        ("option_profit_7d",  "REAL"),
     ]:
         if col not in existing:
             conn.execute(f"ALTER TABLE performance ADD COLUMN {col} {defn}")
@@ -461,6 +477,7 @@ def update_performance_24h(
     row_id: int, price: float, pct_change: float, outcome: str,
     option_value: float | None = None,
     option_return: float | None = None,
+    option_profit: float | None = None,
     option_outcome: str | None = None,
 ) -> None:
     sql = """
@@ -470,12 +487,13 @@ def update_performance_24h(
             outcome            = ?,
             option_value_24h   = ?,
             option_return_24h  = ?,
+            option_profit_24h  = ?,
             option_outcome_24h = ?
         WHERE id = ?
     """
     try:
         with _connect() as conn:
-            conn.execute(sql, (price, pct_change, outcome, option_value, option_return, option_outcome, row_id))
+            conn.execute(sql, (price, pct_change, outcome, option_value, option_return, option_profit, option_outcome, row_id))
     except Exception as exc:
         logger.error("update_performance_24h failed for id=%s: %s", row_id, exc)
 
@@ -484,6 +502,7 @@ def update_performance_6h(
     row_id: int, price: float, pct_change: float, outcome: str,
     option_value: float | None = None,
     option_return: float | None = None,
+    option_profit: float | None = None,
     option_outcome: str | None = None,
 ) -> None:
     sql = """
@@ -493,12 +512,13 @@ def update_performance_6h(
             outcome_6h        = ?,
             option_value_6h   = ?,
             option_return_6h  = ?,
+            option_profit_6h  = ?,
             option_outcome_6h = ?
         WHERE id = ?
     """
     try:
         with _connect() as conn:
-            conn.execute(sql, (price, pct_change, outcome, option_value, option_return, option_outcome, row_id))
+            conn.execute(sql, (price, pct_change, outcome, option_value, option_return, option_profit, option_outcome, row_id))
     except Exception as exc:
         logger.error("update_performance_6h failed for id=%s: %s", row_id, exc)
 
@@ -507,6 +527,7 @@ def update_performance_7d(
     row_id: int, price: float, pct_change: float, outcome: str,
     option_value: float | None = None,
     option_return: float | None = None,
+    option_profit: float | None = None,
     option_outcome: str | None = None,
 ) -> None:
     sql = """
@@ -516,12 +537,13 @@ def update_performance_7d(
             outcome           = ?,
             option_value_7d   = ?,
             option_return_7d  = ?,
+            option_profit_7d  = ?,
             option_outcome_7d = ?
         WHERE id = ?
     """
     try:
         with _connect() as conn:
-            conn.execute(sql, (price, pct_change, outcome, option_value, option_return, option_outcome, row_id))
+            conn.execute(sql, (price, pct_change, outcome, option_value, option_return, option_profit, option_outcome, row_id))
     except Exception as exc:
         logger.error("update_performance_7d failed for id=%s: %s", row_id, exc)
 
