@@ -29,7 +29,14 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "https://www.reddit.com/r/{sub}/{sort}.json"
 _HEADERS = {"User-Agent": config.REDDIT_USER_AGENT}
 
-_DAILY_DISCUSSION_KEYWORDS = ("What Are Your Moves", "Daily Discussion")
+_DAILY_DISCUSSION_KEYWORDS = (
+    "Daily Discussion",
+    "What Are Your Moves",
+    "Weekend Discussion",
+    "Weekend Thread",
+    "Monday Thread",
+    "Pre-Market",
+)
 
 _TICKER_RE = re.compile(r'\$[A-Z]{1,5}\b')
 
@@ -174,6 +181,7 @@ def _find_daily_discussion() -> dict | None:
                 logger.info(
                     "Found daily discussion post '%s' (id=%s) in %s", title, post_id, sort
                 )
+                print(f"\n[INFO] Discussion thread found ({sort}): {title!r}")
                 return {"id": post_id, "title": title}
         time.sleep(config.REDDIT_REQUEST_DELAY)
     logger.warning("No daily discussion post found in hot or new")
