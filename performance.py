@@ -74,24 +74,113 @@ def _outcome(signal: str, pct_change: float) -> str:
     return "WIN" if pct_change < 0 else "LOSS"   # SELL wins when price drops
 
 
-def _option_perf(row: dict, current_price: float) -> tuple[float | None, float | None, float | None, str | None]:
-    """Return (option_value, option_return_pct, option_profit, option_outcome).
-    Returns (None, None, None, None) when the row has no options data."""
+def _safe_float(val, default: float = 0.0) -> float:
+    """Convert val to float, returning default for None/NaN."""
+    try:
+        f = float(val)
+        return f if f == f else default  # NaN != NaN
+    except (TypeError, ValueError):
+        return default
+
+
+def _fetch_option_market_price(
+    ticker: str,
+    contract_symbol: str,
+    expiry_str: str | None,
+    opt_type: str,
+    strike: float,
+    current_stock_price: float,
+) -> tuple[float, str]:
+    """Fetch the current market price of an option contract.
+
+    Returns (price_per_share, source) where source is one of:
+      'live'      — actual bid/ask mid from the options chain
+      'intrinsic' — contract expired; intrinsic value at expiry stock price
+      'estimate'  — not expired but contract not found; intrinsic only (no time value)
+    """
+    today = datetime.utcnow().date()
+
+    expiry_date: "datetime.date | None" = None
+    if expiry_str:
+        try:
+            expiry_date = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
+        except ValueError:
+            pass
+
+    is_expired = expiry_date is not None and expiry_date < today
+
+    # ── Attempt live fetch for unexpired contracts ────────────────────────────
+    if not is_expired and expiry_str:
+        try:
+            t = yf.Ticker(ticker)
+            chain = t.option_chain(expiry_str[:10])
+            df = chain.calls if opt_type.upper() == "CALL" else chain.puts
+
+            match = df[df["contractSymbol"] == contract_symbol]
+            if not match.empty:
+                row = match.iloc[0]
+                bid = _safe_float(row.get("bid"))
+                ask = _safe_float(row.get("ask"))
+                if bid > 0 and ask > 0:
+                    return (bid + ask) / 2, "live"
+                if ask > 0:
+                    return ask, "live"
+                last = _safe_float(row.get("lastPrice"))
+                if last > 0:
+                    return last, "live"
+        except Exception as exc:
+            logger.warning("Option chain fetch failed for %s (%s): %s", contract_symbol, ticker, exc)
+
+    # ── Expired: intrinsic value at the expiry stock price ───────────────────
+    if is_expired:
+        expiry_ts = expiry_str[:10] + " 16:00:00"  # type: ignore[index]
+        stock_at_expiry = _fetch_historical_price(ticker, expiry_ts) or current_stock_price
+        if opt_type.upper() == "CALL":
+            intrinsic = max(0.0, stock_at_expiry - strike)
+        else:
+            intrinsic = max(0.0, strike - stock_at_expiry)
+        return intrinsic, "intrinsic"
+
+    # ── Not expired but missing from chain: intrinsic-only estimate ──────────
+    if opt_type.upper() == "CALL":
+        intrinsic = max(0.0, current_stock_price - strike)
+    else:
+        intrinsic = max(0.0, strike - current_stock_price)
+    return intrinsic, "estimate"
+
+
+def _option_perf(
+    row: dict, current_price: float
+) -> tuple[float | None, float | None, float | None, str | None, str | None]:
+    """Return (option_value, option_return_pct, option_profit, option_outcome, price_source).
+    Returns all None when the row has no options data."""
     strike   = row.get("option_strike")
     cost     = row.get("option_cost")
     opt_type = row.get("option_type")
-    if not (strike and cost and opt_type and cost > 0):
-        return None, None, None, None
+    contract = row.get("option_contract")
+    expiry   = row.get("option_expiry")
+    ticker   = row.get("ticker")
 
-    if opt_type == "CALL":
-        option_value = max(0.0, current_price - strike) * 100
+    if not (strike and cost and opt_type and cost > 0):
+        return None, None, None, None, None
+
+    if contract and ticker:
+        price_per_share, source = _fetch_option_market_price(
+            ticker, contract, expiry, opt_type, strike, current_price
+        )
+        option_value = price_per_share * 100
     else:
-        option_value = max(0.0, strike - current_price) * 100
+        # No contract symbol stored — fall back to intrinsic value
+        if opt_type.upper() == "CALL":
+            option_value = max(0.0, current_price - strike) * 100
+        else:
+            option_value = max(0.0, strike - current_price) * 100
+        source = "intrinsic"
 
     option_return = ((option_value - cost) / cost) * 100
     option_profit = option_value - cost
     outcome = "WIN" if option_profit > 0 else "LOSS"
-    return round(option_value, 2), round(option_return, 4), round(option_profit, 2), outcome
+    return round(option_value, 2), round(option_return, 4), round(option_profit, 2), outcome, source
 
 
 # ── Public: update ────────────────────────────────────────────────────────────
@@ -133,13 +222,13 @@ def update_performance() -> None:
         if price is None:
             continue
         pct = (price - row["price_at_signal"]) / row["price_at_signal"] * 100
-        opt_val, opt_ret, opt_profit, opt_out = _option_perf(row, price)
+        opt_val, opt_ret, opt_profit, opt_out, opt_src = _option_perf(row, price)
         update_performance_6h(row["id"], price, pct, _outcome(row["signal"], pct),
-                               opt_val, opt_ret, opt_profit, opt_out)
+                               opt_val, opt_ret, opt_profit, opt_out, opt_src)
         updated_6h += 1
         logger.info(
-            "6h update: %s %s  entry=%.2f  now=%.2f  pct=%.2f%%",
-            row["signal"], row["ticker"], row["price_at_signal"], price, pct,
+            "6h update: %s %s  entry=%.2f  now=%.2f  pct=%.2f%%  opt_src=%s",
+            row["signal"], row["ticker"], row["price_at_signal"], price, pct, opt_src,
         )
 
     for row in get_pending_24h_rows():
@@ -147,13 +236,13 @@ def update_performance() -> None:
         if price is None:
             continue
         pct = (price - row["price_at_signal"]) / row["price_at_signal"] * 100
-        opt_val, opt_ret, opt_profit, opt_out = _option_perf(row, price)
+        opt_val, opt_ret, opt_profit, opt_out, opt_src = _option_perf(row, price)
         update_performance_24h(row["id"], price, pct, _outcome(row["signal"], pct),
-                                opt_val, opt_ret, opt_profit, opt_out)
+                                opt_val, opt_ret, opt_profit, opt_out, opt_src)
         updated_24h += 1
         logger.info(
-            "24h update: %s %s  entry=%.2f  now=%.2f  pct=%.2f%%",
-            row["signal"], row["ticker"], row["price_at_signal"], price, pct,
+            "24h update: %s %s  entry=%.2f  now=%.2f  pct=%.2f%%  opt_src=%s",
+            row["signal"], row["ticker"], row["price_at_signal"], price, pct, opt_src,
         )
 
     for row in get_pending_7d_rows():
@@ -161,13 +250,13 @@ def update_performance() -> None:
         if price is None:
             continue
         pct = (price - row["price_at_signal"]) / row["price_at_signal"] * 100
-        opt_val, opt_ret, opt_profit, opt_out = _option_perf(row, price)
+        opt_val, opt_ret, opt_profit, opt_out, opt_src = _option_perf(row, price)
         update_performance_7d(row["id"], price, pct, _outcome(row["signal"], pct),
-                               opt_val, opt_ret, opt_profit, opt_out)
+                               opt_val, opt_ret, opt_profit, opt_out, opt_src)
         updated_7d += 1
         logger.info(
-            "7d update: %s %s  entry=%.2f  now=%.2f  pct=%.2f%%",
-            row["signal"], row["ticker"], row["price_at_signal"], price, pct,
+            "7d update: %s %s  entry=%.2f  now=%.2f  pct=%.2f%%  opt_src=%s",
+            row["signal"], row["ticker"], row["price_at_signal"], price, pct, opt_src,
         )
 
     logger.info(

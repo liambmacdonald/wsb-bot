@@ -1309,6 +1309,7 @@ async function refreshPerf() {
     const optRet = r.option_return_7d ?? r.option_return_24h ?? r.option_return_6h;
     const optVal = r.option_value_7d  ?? r.option_value_24h  ?? r.option_value_6h;
     const optCost = r.option_cost;
+    const optSrc  = r.option_price_source;
     let optRetHtml = '<span class="neu">—</span>';
     if (optRet != null && optCost != null) {
       const profit = optVal != null ? optVal - optCost : null;
@@ -1317,6 +1318,12 @@ async function refreshPerf() {
       let str = `<span class="${cls}" style="white-space:nowrap">${sign}${optRet.toFixed(1)}%`;
       if (profit != null) {
         str += `<br><small>${profit >= 0 ? '+' : ''}$${Math.abs(profit).toFixed(0)}</small>`;
+      }
+      if (optSrc) {
+        const srcMap = {live:'Live',intrinsic:'At Expiry',estimate:'Est.',expired:'Expired'};
+        const srcLabel = srcMap[optSrc] || optSrc;
+        const srcCls = optSrc === 'live' ? 'up' : optSrc === 'expired' ? 'dn' : 'neu';
+        str += `<br><small class="${srcCls}" style="font-size:9px;letter-spacing:.04em;opacity:.75">${srcLabel}</small>`;
       }
       str += '</span>';
       optRetHtml = str;
@@ -1361,6 +1368,10 @@ async function refreshOptions() {
       const iv     = r.option_iv     ? (r.option_iv * 100).toFixed(0) + '%'     : '—';
       const delta  = r.option_delta  ? Number(r.option_delta).toFixed(2)        : '—';
       const when   = timeAgo(r.signal_timestamp);
+      const src    = r.option_price_source;
+      const srcMap = {live:'Live price',intrinsic:'At expiry',estimate:'Estimate (no time val)',expired:'Expired'};
+      const srcLabel = src ? (srcMap[src] || src) : null;
+      const srcCls   = src === 'live' ? 'up' : src === 'expired' ? 'dn' : 'neu';
       return `<div class="option-item">
         <div class="option-item-head">
           <span class="option-ticker">${r.ticker}</span>
@@ -1373,6 +1384,7 @@ async function refreshOptions() {
           <div class="ometa"><span class="ometa-l">Cost</span><span class="ometa-v">${cost}</span></div>
           <div class="ometa"><span class="ometa-l">IV</span><span class="ometa-v ${r.option_iv > 0.8 ? 'dn' : ''}">${iv}</span></div>
           <div class="ometa"><span class="ometa-l">Delta</span><span class="ometa-v">${delta}</span></div>
+          ${srcLabel ? `<div class="ometa"><span class="ometa-l">P&amp;L Basis</span><span class="ometa-v ${srcCls}">${srcLabel}</span></div>` : ''}
         </div>
       </div>`;
     }).join('');
