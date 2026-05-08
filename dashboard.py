@@ -6,14 +6,21 @@ Call dashboard.set_last_run() after each pipeline cycle to update the status pil
 
 import sqlite3
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
+import yfinance as yf
 from flask import Flask, jsonify, Response
 
 from config import DB_PATH
 
 app = Flask(__name__)
 _last_run: datetime | None = None
+
+_price_cache: list = []
+_price_cache_ts: float = 0.0
+_price_lock = threading.Lock()
 
 
 def set_last_run() -> None:
@@ -26,6 +33,24 @@ def _db() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
+
+
+def _fetch_price(ticker: str) -> tuple[str, float | None]:
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        for attr in ("last_price", "lastPrice", "regular_market_price", "regularMarketPrice"):
+            price = getattr(fi, attr, None)
+            if price and float(price) > 0:
+                return ticker, float(price)
+    except Exception:
+        pass
+    try:
+        hist = yf.Ticker(ticker).history(period="1d", interval="5m")
+        if not hist.empty:
+            return ticker, float(hist["Close"].iloc[-1])
+    except Exception:
+        pass
+    return ticker, None
 
 
 # ── API ────────────────────────────────────────────────────────────────────────
@@ -55,7 +80,6 @@ def api_stats():
     wins_24h = sum(1 for r in resolved_24h if r.get("outcome") == "WIN")
     win_rate_24h = round(wins_24h / len(resolved_24h) * 100, 1) if resolved_24h else None
 
-    # Best call: highest pct change, prefer 24h then 6h
     best_call = None
     def _pct(r: dict) -> float:
         return r.get("percent_change_24h") or r.get("percent_change_6h") or 0.0
@@ -138,6 +162,69 @@ def api_signals():
         return jsonify([])
     finally:
         conn.close()
+
+
+@app.route("/api/prices")
+def api_prices():
+    global _price_cache, _price_cache_ts
+
+    now = time.time()
+    with _price_lock:
+        if now - _price_cache_ts < 25 and _price_cache:
+            return jsonify(list(_price_cache))
+
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT ticker, price_at_signal FROM performance ORDER BY signal_timestamp DESC"
+        ).fetchall()
+    except Exception:
+        return jsonify([])
+    finally:
+        conn.close()
+
+    entry_prices: dict[str, float] = {}
+    for r in rows:
+        t, p = r["ticker"], r["price_at_signal"]
+        if t not in entry_prices and p is not None:
+            entry_prices[t] = float(p)
+
+    if not entry_prices:
+        return jsonify([])
+
+    tickers = list(entry_prices.keys())
+    prices: dict[str, float | None] = {}
+
+    with ThreadPoolExecutor(max_workers=min(len(tickers), 8)) as ex:
+        future_map = {ex.submit(_fetch_price, t): t for t in tickers}
+        try:
+            for f in as_completed(future_map, timeout=1.8):
+                try:
+                    t, price = f.result()
+                    prices[t] = price
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    result = []
+    for t in tickers:
+        curr = prices.get(t)
+        entry = entry_prices.get(t)
+        if curr is not None:
+            pct = round((curr - entry) / entry * 100, 2) if entry else None
+            result.append({
+                "ticker": t,
+                "price": round(curr, 2),
+                "change_pct": pct,
+                "entry_price": entry,
+            })
+
+    with _price_lock:
+        _price_cache = result
+        _price_cache_ts = time.time()
+
+    return jsonify(result)
 
 
 # ── Server ─────────────────────────────────────────────────────────────────────
@@ -246,9 +333,7 @@ body{
   letter-spacing:-0.4px;
   color:var(--text);
 }
-.nav-logo span{
-  color:var(--blue);
-}
+.nav-logo span{color:var(--blue)}
 .nav-sep{
   width:1px;height:18px;
   background:var(--border);
@@ -293,9 +378,76 @@ body{
   letter-spacing:0.01em;
 }
 
+/* ── Prices live indicator ────────────────────────────────────────────────── */
+.prices-live{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  font-size:11px;
+  color:var(--text3);
+  letter-spacing:.02em;
+  user-select:none;
+}
+.pl-dot{
+  width:6px;height:6px;
+  background:var(--green);
+  border-radius:50%;
+  flex-shrink:0;
+  animation:pulse 2.4s ease-in-out infinite;
+}
+.pl-dot.flash{
+  animation:pl-flash .6s ease-out forwards;
+}
+@keyframes pl-flash{
+  0%{opacity:1;transform:scale(2.2);background:#ffffff}
+  60%{transform:scale(1.4);background:var(--green)}
+  100%{opacity:1;transform:scale(1);background:var(--green)}
+}
+
+/* ── Ticker bar ───────────────────────────────────────────────────────────── */
+.ticker-bar{
+  position:fixed;
+  top:54px;left:0;right:0;
+  height:30px;
+  background:rgba(0,0,0,0.9);
+  backdrop-filter:blur(12px);
+  -webkit-backdrop-filter:blur(12px);
+  border-bottom:1px solid var(--border);
+  overflow:hidden;
+  z-index:999;
+  display:flex;
+  align-items:center;
+}
+.ticker-track{
+  display:inline-flex;
+  align-items:center;
+  white-space:nowrap;
+  will-change:transform;
+}
+@keyframes ticker-scroll{
+  from{transform:translateX(0)}
+  to{transform:translateX(-50%)}
+}
+.ti-item{
+  display:inline-flex;
+  align-items:center;
+  gap:4px;
+  padding:0 18px;
+  font-size:11.5px;
+  font-variant-numeric:tabular-nums;
+}
+.ti-ticker{
+  font-weight:700;
+  font-size:12px;
+  letter-spacing:-.1px;
+  color:var(--text);
+}
+.ti-sep{color:var(--text3);padding:0 4px;font-size:10px}
+.ti-arrow{font-size:8px;line-height:1}
+
 /* ── Layout ───────────────────────────────────────────────────────────────── */
 .main{
-  padding:72px 24px 52px;
+  padding:94px 24px 52px;
   max-width:1440px;
   margin:0 auto;
   display:flex;
@@ -403,7 +555,7 @@ body{
   width:100%;
   border-collapse:collapse;
   font-size:12.5px;
-  min-width:720px;
+  min-width:820px;
 }
 .perf-table thead th{
   font-size:10.5px;
@@ -416,9 +568,7 @@ body{
   border-bottom:1px solid rgba(255,255,255,0.07);
   white-space:nowrap;
 }
-.perf-table thead th:first-child{
-  padding-left:20px;
-}
+.perf-table thead th:first-child{padding-left:20px}
 .perf-table tbody tr{
   transition:background .12s ease;
   cursor:default;
@@ -428,9 +578,7 @@ body{
   from{opacity:0;transform:translateY(5px)}
   to{opacity:1;transform:translateY(0)}
 }
-.perf-table tbody tr:hover td{
-  background:rgba(255,255,255,0.03);
-}
+.perf-table tbody tr:hover td{background:rgba(255,255,255,0.03)}
 .perf-table tbody td{
   padding:9px 14px;
   border-bottom:1px solid rgba(255,255,255,0.04);
@@ -438,19 +586,10 @@ body{
   white-space:nowrap;
   color:var(--text);
 }
-.perf-table tbody td:first-child{
-  padding-left:18px;
-}
-/* Left-border outcome indicator via box-shadow on first td */
-.perf-table tbody tr.t-win td:first-child{
-  box-shadow:inset 3px 0 0 var(--green);
-}
-.perf-table tbody tr.t-loss td:first-child{
-  box-shadow:inset 3px 0 0 var(--red);
-}
-.perf-table tbody tr.t-pending td:first-child{
-  box-shadow:inset 3px 0 0 var(--blue);
-}
+.perf-table tbody td:first-child{padding-left:18px}
+.perf-table tbody tr.t-win td:first-child{box-shadow:inset 3px 0 0 var(--green)}
+.perf-table tbody tr.t-loss td:first-child{box-shadow:inset 3px 0 0 var(--red)}
+.perf-table tbody tr.t-pending td:first-child{box-shadow:inset 3px 0 0 var(--blue)}
 .perf-table tbody tr.t-win{background:rgba(48,209,88,.025)}
 .perf-table tbody tr.t-loss{background:rgba(255,69,58,.025)}
 .perf-table tbody tr.t-pending{background:rgba(10,132,255,.02)}
@@ -520,9 +659,7 @@ body{
   flex-wrap:wrap;
   gap:14px;
 }
-.ometa{
-  font-size:11px;
-}
+.ometa{font-size:11px}
 .ometa-l{
   display:block;
   font-size:9.5px;
@@ -536,7 +673,6 @@ body{
   color:var(--text2);
   font-variant-numeric:tabular-nums;
 }
-
 .iv-item{
   background:rgba(255,69,58,0.07);
   border:1px solid rgba(255,69,58,0.18);
@@ -569,41 +705,15 @@ body{
   animation:rowIn .25s ease both;
   white-space:nowrap;
 }
-.sig-pill.sp-buy{
-  background:rgba(48,209,88,.1);
-  border:1px solid rgba(48,209,88,.2);
-  color:var(--green);
-}
-.sig-pill.sp-sell{
-  background:rgba(255,69,58,.1);
-  border:1px solid rgba(255,69,58,.2);
-  color:var(--red);
-}
-.sig-pill.sp-hold{
-  background:rgba(10,132,255,.1);
-  border:1px solid rgba(10,132,255,.2);
-  color:var(--blue);
-}
-.sig-time{
-  color:rgba(255,255,255,0.35);
-  font-size:10.5px;
-  font-variant-numeric:tabular-nums;
-}
+.sig-pill.sp-buy{background:rgba(48,209,88,.1);border:1px solid rgba(48,209,88,.2);color:var(--green)}
+.sig-pill.sp-sell{background:rgba(255,69,58,.1);border:1px solid rgba(255,69,58,.2);color:var(--red)}
+.sig-pill.sp-hold{background:rgba(10,132,255,.1);border:1px solid rgba(10,132,255,.2);color:var(--blue)}
+.sig-time{color:rgba(255,255,255,0.35);font-size:10.5px;font-variant-numeric:tabular-nums}
 .sig-ticker{font-weight:700}
 
 /* ── Empty states ─────────────────────────────────────────────────────────── */
-.empty{
-  color:var(--text3);
-  font-size:13px;
-  padding:28px 0;
-  text-align:center;
-}
-.empty-cell{
-  color:var(--text3);
-  font-size:13px;
-  padding:40px 24px !important;
-  text-align:center;
-}
+.empty{color:var(--text3);font-size:13px;padding:28px 0;text-align:center}
+.empty-cell{color:var(--text3);font-size:13px;padding:40px 24px !important;text-align:center}
 
 /* ── Responsive ───────────────────────────────────────────────────────────── */
 @media(max-width:960px){
@@ -612,7 +722,7 @@ body{
 }
 @media(max-width:540px){
   .metrics-row{grid-template-columns:1fr}
-  .main{padding:68px 16px 40px}
+  .main{padding:90px 16px 40px}
   .nav{padding:0 16px}
 }
 </style>
@@ -628,14 +738,25 @@ body{
     <span class="nav-logo">WSB<span>&nbsp;Bot</span></span>
     <div class="nav-sep"></div>
     <div class="status-pill" id="statusPill">
-      <div class="status-dot" id="statusDot"></div>
+      <div class="status-dot"></div>
       <span id="statusLabel">Loading</span>
     </div>
   </div>
   <div class="nav-right">
+    <div class="prices-live">
+      <div class="pl-dot" id="plDot"></div>
+      <span>Prices live</span>
+    </div>
     <span class="nav-time" id="navTime">—</span>
   </div>
 </nav>
+
+<!-- Live ticker bar -->
+<div class="ticker-bar">
+  <div class="ticker-track" id="tickerTrack">
+    <span class="ti-item"><span class="ti-ticker" style="color:var(--text3);font-weight:400">Fetching prices…</span></span>
+  </div>
+</div>
 
 <!-- Main -->
 <main class="main">
@@ -677,6 +798,8 @@ body{
             <th>Ticker</th>
             <th>Direction</th>
             <th>Entry</th>
+            <th>Live</th>
+            <th>Chg</th>
             <th>6h</th>
             <th>24h</th>
             <th>7d</th>
@@ -686,7 +809,7 @@ body{
           </tr>
         </thead>
         <tbody id="perfBody">
-          <tr><td colspan="9" class="empty-cell">Loading performance data…</td></tr>
+          <tr><td colspan="11" class="empty-cell">Loading performance data…</td></tr>
         </tbody>
       </table>
     </div>
@@ -724,7 +847,8 @@ body{
 </main>
 
 <script>
-const INTERVAL = 30000;
+const PIPELINE_INTERVAL = 960000; // 16 minutes
+const PRICE_INTERVAL    = 30000;  // 30 seconds
 
 async function get(url) {
   try { const r = await fetch(url); return r.ok ? r.json() : null; }
@@ -768,9 +892,7 @@ async function refreshStats() {
   const d = await get('/api/stats');
   if (!d) return;
 
-  // Status pill
   const pill = document.getElementById('statusPill');
-  const dot  = document.getElementById('statusDot');
   const lbl  = document.getElementById('statusLabel');
   if (d.bot_running) {
     pill.classList.remove('offline');
@@ -781,10 +903,8 @@ async function refreshStats() {
   }
   document.getElementById('navTime').textContent = d.last_updated || '—';
 
-  // Card 0 — total
   document.getElementById('mv0').textContent = d.total_signals ?? '—';
 
-  // Card 1 — 6h win rate
   const wr6 = d.win_rate_6h;
   const mc1 = document.getElementById('mc1');
   const mv1 = document.getElementById('mv1');
@@ -796,7 +916,6 @@ async function refreshStats() {
     mc1.className = 'metric-card c-blue';
   }
 
-  // Card 2 — 24h win rate
   const wr24 = d.win_rate_24h;
   const mc2  = document.getElementById('mc2');
   const mv2  = document.getElementById('mv2');
@@ -808,7 +927,6 @@ async function refreshStats() {
     mc2.className = 'metric-card c-blue';
   }
 
-  // Card 3 — best call
   const mc3 = document.getElementById('mc3');
   const mv3 = document.getElementById('mv3');
   const ms3 = document.getElementById('ms3');
@@ -832,7 +950,7 @@ async function refreshPerf() {
 
   const tbody = document.getElementById('perfBody');
   if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="9" class="empty-cell">No performance data yet — run the bot to generate signals.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="11" class="empty-cell">No performance data yet — run the bot to generate signals.</td></tr>';
     return;
   }
 
@@ -858,10 +976,14 @@ async function refreshPerf() {
       ? `<span title="${r.option_contract}">${r.option_type || '?'}&nbsp;$${r.option_strike || '?'}</span>`
       : '<span class="neu">—</span>';
 
+    const tk = (r.ticker || '').replace(/[^A-Z0-9.]/g, '');
+
     return `<tr class="${trCls}" style="animation-delay:${Math.min(i * 15, 300)}ms">
       <td><span class="ticker-name">${r.ticker}</span></td>
       <td>${dirBadge}</td>
       <td class="mono">${fmt$(r.price_at_signal)}</td>
+      <td class="mono price-cell" data-ticker="${tk}"><span class="neu">—</span></td>
+      <td class="mono chg-cell"   data-ticker="${tk}"><span class="neu">—</span></td>
       <td class="mono">${fmtPct(r.percent_change_6h)}</td>
       <td class="mono">${fmtPct(r.percent_change_24h)}</td>
       <td class="mono">${fmtPct(r.percent_change_7d)}</td>
@@ -876,7 +998,7 @@ async function refreshOptions() {
   const data = await get('/api/options');
   if (!data) return;
 
-  const recs = data.recommendations || [];
+  const recs  = data.recommendations || [];
   const warns = data.iv_warnings || [];
 
   document.getElementById('recsBadge').textContent = recs.length + ' active';
@@ -886,9 +1008,7 @@ async function refreshOptions() {
     recsEl.innerHTML = '<p class="empty">No option recommendations yet</p>';
   } else {
     recsEl.innerHTML = recs.map(r => {
-      const badge = r.signal === 'BUY'
-        ? '<span class="b b-buy">BUY</span>'
-        : '<span class="b b-sell">SELL</span>';
+      const badge  = r.signal === 'BUY' ? '<span class="b b-buy">BUY</span>' : '<span class="b b-sell">SELL</span>';
       const strike = r.option_strike ? '$' + Number(r.option_strike).toFixed(0) : '—';
       const cost   = r.option_cost   ? '$' + Number(r.option_cost).toFixed(2)   : '—';
       const iv     = r.option_iv     ? (r.option_iv * 100).toFixed(0) + '%'     : '—';
@@ -958,20 +1078,92 @@ async function refreshSignals() {
   }).join('');
 }
 
-function kickProgress() {
-  const el = document.getElementById('pgFill');
-  el.classList.remove('run');
-  void el.offsetWidth; // force reflow to restart animation
-  el.classList.add('run');
+function updateTickerBar(data) {
+  if (!data || !data.length) return;
+  const track = document.getElementById('tickerTrack');
+
+  const items = data.map(({ ticker, price, change_pct }) => {
+    const isUp  = change_pct != null && change_pct >= 0;
+    const isDn  = change_pct != null && change_pct < 0;
+    const cls   = isDn ? 'dn' : isUp ? 'up' : 'neu';
+    const arrow = isDn ? '▼' : isUp ? '▲' : '';
+    const pStr  = price != null ? '$' + Number(price).toFixed(2) : '—';
+    const cStr  = change_pct != null
+      ? (change_pct >= 0 ? '+' : '') + Number(change_pct).toFixed(2) + '%'
+      : '';
+    return `<span class="ti-item">` +
+      `<span class="ti-ticker">${ticker}</span>` +
+      ` <span class="${cls}">` +
+        (arrow ? `<span class="ti-arrow">${arrow}</span> ` : '') +
+        `${pStr}</span>` +
+      (cStr ? ` <span class="${cls}">${cStr}</span>` : '') +
+      `</span>`;
+  }).join('<span class="ti-sep">·</span>');
+
+  // Duplicate for seamless infinite scroll
+  const sep  = '<span class="ti-sep" style="padding:0 12px">·</span>';
+  track.innerHTML = items + sep + items;
+
+  const dur = Math.max(20, data.length * 5);
+  track.style.animation = 'none';
+  void track.offsetWidth; // force reflow to restart
+  track.style.animation = `ticker-scroll ${dur}s linear infinite`;
 }
 
-async function refresh() {
-  await Promise.all([refreshStats(), refreshPerf(), refreshOptions(), refreshSignals()]);
+async function refreshPrices() {
+  const data = await get('/api/prices');
+
+  if (data && data.length) {
+    data.forEach(({ ticker, price, change_pct }) => {
+      const isUp  = change_pct != null && change_pct >= 0;
+      const isDn  = change_pct != null && change_pct < 0;
+      const cls   = isDn ? 'dn' : isUp ? 'up' : 'neu';
+      const arrow = isDn ? '▼' : isUp ? '▲' : '';
+      const pStr  = price != null ? '$' + Number(price).toFixed(2) : '—';
+      const cStr  = change_pct != null
+        ? `<span class="${cls}">${change_pct >= 0 ? '+' : ''}${Number(change_pct).toFixed(2)}%</span>`
+        : `<span class="neu">—</span>`;
+
+      const priceHtml = price != null
+        ? `<span class="${cls}">${arrow ? `<span class="ti-arrow">${arrow}</span> ` : ''}${pStr}</span>`
+        : `<span class="neu">—</span>`;
+
+      document.querySelectorAll(`.price-cell[data-ticker="${ticker}"]`).forEach(el => {
+        el.innerHTML = priceHtml;
+      });
+      document.querySelectorAll(`.chg-cell[data-ticker="${ticker}"]`).forEach(el => {
+        el.innerHTML = cStr;
+      });
+    });
+
+    updateTickerBar(data);
+  }
+
+  // Flash the prices-live dot
+  const dot = document.getElementById('plDot');
+  dot.classList.remove('flash');
+  void dot.offsetWidth;
+  dot.classList.add('flash');
+  setTimeout(() => dot.classList.remove('flash'), 700);
+
   kickProgress();
 }
 
-refresh();
-setInterval(refresh, INTERVAL);
+function kickProgress() {
+  const el = document.getElementById('pgFill');
+  el.classList.remove('run');
+  void el.offsetWidth;
+  el.classList.add('run');
+}
+
+async function refreshPipeline() {
+  await Promise.all([refreshStats(), refreshPerf(), refreshOptions(), refreshSignals()]);
+  await refreshPrices(); // fill live price cells immediately after table rebuild
+}
+
+refreshPipeline();
+setInterval(refreshPipeline, PIPELINE_INTERVAL);
+setInterval(refreshPrices,  PRICE_INTERVAL);
 </script>
 </body>
 </html>"""
