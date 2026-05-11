@@ -17,7 +17,8 @@
       "Bash(curl -s http://localhost:5000/api/performance)",
       "Bash(curl -s http://127.0.0.1:5000/api/stats)",
       "Bash(curl -s http://127.0.0.1:5000/api/performance)",
-      "Bash(curl -s http://127.0.0.1:5000/)"
+      "Bash(curl -s http://127.0.0.1:5000/)",
+      "PowerShell(python -c \"import ast; ast.parse\\(open\\('C:/Users/Liam/wsb-bot/dashboard.py'\\).read\\(\\)\\); print\\('Python syntax OK'\\)\")"
     ]
   }
 }

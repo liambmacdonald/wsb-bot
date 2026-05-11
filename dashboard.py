@@ -664,6 +664,29 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Ne
 .perf-table tbody tr.t-pending{background:rgba(10,132,255,.02)}
 .ticker-name{font-size:13.5px;font-weight:600;letter-spacing:-.2px}
 
+/* ── TODAY VIEW TOGGLE ────────────────────────────────────────────────────── */
+.view-toggle{display:inline-flex;align-items:center;gap:4px;background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:10px;padding:3px}
+.vt-btn{padding:5px 15px;border-radius:7px;font-size:12px;font-weight:500;color:var(--text2);cursor:pointer;border:none;background:transparent;transition:all .15s;white-space:nowrap}
+.vt-btn.active{background:rgba(255,255,255,.12);color:var(--text);box-shadow:0 1px 4px rgba(0,0,0,.4)}
+.vt-btn:hover:not(.active){color:var(--text)}
+.today-view-header{display:flex;align-items:center;justify-content:flex-start}
+
+/* ── STOCKS TABLE VIEW ────────────────────────────────────────────────────── */
+.stocks-table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:560px}
+.stocks-table thead th{font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--text3);padding:8px 14px 10px;text-align:left;border-bottom:1px solid rgba(255,255,255,.07);white-space:nowrap}
+.stocks-table thead th:first-child{padding-left:20px}
+.stocks-table tbody tr{transition:background .12s;animation:rowIn .25s ease both}
+.stocks-table tbody tr:hover td{background:rgba(255,255,255,.03)}
+.stocks-table tbody td{padding:10px 14px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle;white-space:nowrap;color:var(--text)}
+.stocks-table tbody td:first-child{padding-left:18px}
+.stocks-table tbody tr.sv-buy td:first-child{box-shadow:inset 3px 0 0 var(--green)}
+.stocks-table tbody tr.sv-sell td:first-child{box-shadow:inset 3px 0 0 var(--red)}
+.sv-ticker-big{font-size:15px;font-weight:700;letter-spacing:-.4px}
+.sv-opts-note{font-size:10px;color:var(--blue);margin-top:3px}
+.sv-strength-wrap{display:flex;flex-direction:column;gap:3px}
+.sv-strength-track{height:3px;background:rgba(255,255,255,.08);border-radius:100px;overflow:hidden;width:56px}
+.sv-strength-fill{height:100%;background:linear-gradient(90deg,var(--blue),var(--green));border-radius:100px}
+
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 @media(max-width:960px){
   .metrics-row{grid-template-columns:repeat(2,1fr)}
@@ -743,10 +766,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Ne
     </div>
   </div>
 
-  <!-- signal cards -->
-  <div class="today-grid" id="todayGrid">
-    <p class="empty">Loading signals…</p>
+  <!-- view toggle -->
+  <div class="today-view-header">
+    <div class="view-toggle">
+      <button class="vt-btn active" id="vtStocks" onclick="switchTodayView('stocks')">Stocks View</button>
+      <button class="vt-btn" id="vtOptions" onclick="switchTodayView('options')">Options View</button>
+    </div>
   </div>
+
+  <!-- stocks list (default view) -->
+  <div id="todayStocks"><p class="empty">Loading signals…</p></div>
+
+  <!-- options cards -->
+  <div class="today-grid" id="todayGrid" style="display:none"></div>
 
 </main>
 
@@ -756,7 +788,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Ne
   <!-- aggregate stats -->
   <div class="metrics-row" id="histStats">
     <div class="metric-card" id="hmc0">
-      <div class="metric-label">Overall Win Rate</div>
+      <div class="metric-label">Avg 24h Return</div>
       <div class="metric-value" id="hmv0">—</div>
       <div class="metric-sub" id="hms0">resolved signals</div>
     </div>
@@ -813,6 +845,7 @@ let historyData = [];
 let histFilter  = 'ALL';
 let histLoaded  = false;
 let openGroups  = new Set();
+let todayView   = 'stocks';
 
 // ── Utilities ────────────────────────────────────────────────────────────────
 
@@ -864,6 +897,16 @@ function fmtGroupDate(dateStr) {
     const d = new Date(dateStr + 'T12:00:00Z');
     return d.toLocaleDateString('en-US', { month: 'long', day: '2-digit', year: 'numeric', timeZone: 'UTC' });
   } catch { return dateStr; }
+}
+
+// ── Today view toggle ────────────────────────────────────────────────────────
+
+function switchTodayView(v) {
+  todayView = v;
+  document.getElementById('vtStocks').classList.toggle('active', v === 'stocks');
+  document.getElementById('vtOptions').classList.toggle('active', v === 'options');
+  document.getElementById('todayStocks').style.display = v === 'stocks' ? '' : 'none';
+  document.getElementById('todayGrid').style.display   = v === 'options' ? '' : 'none';
 }
 
 // ── Tab switching ─────────────────────────────────────────────────────────────
@@ -947,7 +990,9 @@ function statusBadge(r) {
 async function refreshToday() {
   const data = await get('/api/today');
   if (!data) {
-    document.getElementById('todayGrid').innerHTML = '<p class="empty" style="color:var(--red)">Could not load — server may be offline.</p>';
+    const errMsg = '<p class="empty" style="color:var(--red)">Could not load — server may be offline.</p>';
+    document.getElementById('todayGrid').innerHTML = errMsg;
+    document.getElementById('todayStocks').innerHTML = errMsg;
     return;
   }
 
@@ -980,12 +1025,49 @@ async function refreshToday() {
   document.getElementById('tsSell').textContent  = sells;
   document.getElementById('tsTotal').textContent = signals.length;
 
-  const grid = document.getElementById('todayGrid');
+  const grid     = document.getElementById('todayGrid');
+  const stocksEl = document.getElementById('todayStocks');
   if (!signals.length) {
-    grid.innerHTML = '<p class="empty">No signals in the last 24 hours. The bot analyzes new signals every ~15 minutes.</p>';
+    const msg = '<p class="empty">No signals in the last 24 hours. The bot analyzes new signals every ~15 minutes.</p>';
+    grid.innerHTML = msg;
+    stocksEl.innerHTML = msg;
     return;
   }
 
+  // ── Stocks view ────────────────────────────────────────────────────────────
+  try {
+    stocksEl.innerHTML = `<div class="card" style="padding:0 4px"><div class="table-scroll"><table class="stocks-table">
+      <thead><tr><th>Ticker</th><th>Signal</th><th>Entry</th><th>Current</th><th>Change %</th><th>Strength</th><th>Posts</th></tr></thead>
+      <tbody>${signals.map((r, i) => {
+        const tk       = (r.ticker || '').replace(/[^A-Z0-9.]/g, '');
+        const tw       = r.total_weight || 0;
+        const entry    = r.price_at_signal != null ? '$' + Number(r.price_at_signal).toFixed(2) : '—';
+        const pct      = Math.min(100, Math.round((tw / 60) * 100));
+        const label    = tw >= 40 ? 'Strong' : tw >= 20 ? 'Moderate' : 'Weak';
+        const posts    = r.signal_count || 1;
+        const dir      = r.signal === 'BUY'
+          ? '<span class="b b-buy">BUY</span>'
+          : '<span class="b b-sell">SELL</span>';
+        const optsNote = r.option_contract
+          ? '<div class="sv-opts-note">Options available — click Options View for details</div>' : '';
+        const svCls    = r.signal === 'BUY' ? 'sv-buy' : 'sv-sell';
+        return `<tr class="${svCls}" style="animation-delay:${Math.min(i * 20, 400)}ms">
+          <td><div class="sv-ticker-big">${r.ticker}</div>${optsNote}</td>
+          <td>${dir}</td>
+          <td class="mono">${entry}</td>
+          <td class="mono price-cell" data-ticker="${tk}">—</td>
+          <td class="mono chg-cell" data-ticker="${tk}">—</td>
+          <td><div class="sv-strength-wrap"><span style="font-size:12px;font-weight:500">${label}</span><div class="sv-strength-track"><div class="sv-strength-fill" style="width:${pct}%"></div></div></div></td>
+          <td class="mono">${posts}</td>
+        </tr>`;
+      }).join('')}</tbody>
+    </table></div></div>`;
+  } catch(e) {
+    console.error('stocks view render error:', e);
+    stocksEl.innerHTML = '<p class="empty" style="color:var(--red)">Render error: ' + e.message + '</p>';
+  }
+
+  // ── Options view ────────────────────────────────────────────────────────────
   try { grid.innerHTML = signals.map((r, i) => {
     const sigCls   = r.signal === 'BUY' ? 'sc-buy' : 'sc-sell';
     const dirBadge = r.signal === 'BUY'
@@ -1110,13 +1192,19 @@ function renderHistStats(rows) {
     if (p != null) { totalPnl += p; hasPnl = true; }
   });
 
-  // Stock win rate
+  // Avg 24h Return
   const hmc0 = document.getElementById('hmc0'), hmv0 = document.getElementById('hmv0'), hms0 = document.getElementById('hms0');
-  if (wr6h != null) {
-    hmv0.textContent = wr6h + '%';
-    hmc0.className = 'metric-card ' + (parseFloat(wr6h) >= 50 ? 'c-green' : 'c-red');
-    hms0.textContent = "Stock win rate · " + resolved6h.length + " resolved";
-  } else { hmv0.textContent = "N/A"; hmc0.className = "metric-card"; hms0.textContent = "Stock win rate · no resolved signals"; }
+  document.querySelector('#hmc0 .metric-label').textContent = 'Avg 24h Return';
+  const resolvedForAvg = actionRows.filter(r => r.percent_change_24h != null || r.percent_change_6h != null);
+  const avgRet = resolvedForAvg.length
+    ? resolvedForAvg.reduce((sum, r) => sum + (r.percent_change_24h ?? r.percent_change_6h ?? 0), 0) / resolvedForAvg.length
+    : null;
+  if (avgRet != null) {
+    const sign = avgRet >= 0 ? '+' : '';
+    hmv0.textContent = sign + avgRet.toFixed(1) + '%';
+    hmc0.className = 'metric-card ' + (avgRet >= 0 ? 'c-green' : 'c-red');
+    hms0.textContent = resolvedForAvg.length + " resolved signals";
+  } else { hmv0.textContent = "N/A"; hmc0.className = "metric-card"; hms0.textContent = "no resolved signals"; }
 
   // Options win rate
   const optRows = actionRows.filter(r =>
@@ -1208,9 +1296,13 @@ function renderHistGroups(rows) {
       else if (tStatus === 'CLOSED_EXPIRY') outBadge = '<span class="b b-closed-expiry">EXPIRED</span>';
       else if (tStatus === 'CLOSED_REVERSAL') outBadge = '<span class="b b-closed-reversal">REVERSED</span>';
       else if (tStatus === 'ACTIVE')      outBadge = '<span class="b b-active">ACTIVE</span>';
-      else if (stockEff === 'WIN')        outBadge = '<span class="b b-win">WIN</span>';
-      else if (stockEff === 'LOSS')       outBadge = '<span class="b b-loss">LOSS</span>';
-      else                                outBadge = '<span class="b b-pending">PENDING</span>';
+      else if (stockEff === 'WIN' || stockEff === 'LOSS') {
+        const p = r.percent_change_24h ?? r.percent_change_6h;
+        if (p != null) {
+          const cls = p >= 0 ? 'up' : 'dn';
+          outBadge = `<span class="${cls}">${p >= 0 ? '+' : ''}${Number(p).toFixed(2)}%</span>`;
+        } else { outBadge = '<span class="b b-pending">PENDING</span>'; }
+      } else                              outBadge = '<span class="b b-pending">PENDING</span>';
 
       const optRet  = r.close_return_pct ?? r.option_return_7d ?? r.option_return_24h ?? r.option_return_6h;
       const optVal  = r.close_option_value ?? r.option_value_7d ?? r.option_value_24h ?? r.option_value_6h;
