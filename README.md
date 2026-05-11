@@ -2,7 +2,15 @@
 
 ## Project Overview
 
-This bot scrapes r/wallstreetbets, uses Claude (Haiku) to analyse the sentiment and quality of each post, and aggregates those analyses into weighted BUY / SELL / HOLD signals for individual tickers. It runs on a recurring schedule, simulates paper trades, and tracks how each signal performs at 6h, 24h, and 7d intervals using live prices from Yahoo Finance.
+A Reddit sentiment trading bot that monitors r/wallstreetbets and uses Claude AI to generate BUY/SELL signals with live options recommendations.
+
+- Scrapes the daily discussion thread and hot posts from r/wallstreetbets
+- Fetches 3000+ comments from the daily discussion thread for deep sentiment coverage
+- Claude AI analyzes each post and comment with full WSB cultural context, including irony detection
+- Generates BUY/SELL signals requiring 2+ agreeing posts and 70%+ weighted consensus
+- Recommends options plays (calls/puts) with live data from yfinance
+- Tracks signal performance at 6h, 24h, and 7d checkpoints with full P&L
+- Apple-style web dashboard served at `http://localhost:5000`
 
 ---
 
@@ -10,13 +18,13 @@ This bot scrapes r/wallstreetbets, uses Claude (Haiku) to analyse the sentiment 
 
 Each pipeline cycle runs these stages in order:
 
-1. **Collect** — fetches the top 100 hot/top posts from r/wallstreetbets via Reddit's public JSON endpoint, plus comments from the Daily Discussion thread. Posts that don't meet minimum upvote, comment-count, body-length, and flair criteria are dropped.
-2. **Persist** — new posts are written to a local SQLite database; already-known posts are skipped.
-3. **Analyse** — each new post is sent to Claude, which extracts ticker symbols, assigns a sentiment (bullish / bearish / neutral), rates quality (1–5), and returns a confidence score.
-4. **Save analyses** — results are stored in the database.
-5. **Generate signals** — analyses are grouped by ticker. Each post's weight is `upvotes × quality_score × confidence`. If the dominant side reaches `MIN_AGREEING_POSTS` posts and its weighted share clears `BULLISH_THRESHOLD` or `BEARISH_THRESHOLD`, a BUY or SELL signal is emitted; otherwise HOLD.
-6. **Execute (paper) trades** — signals are logged as simulated trades with the current market price recorded via Yahoo Finance.
-7. **Track performance** — a background job runs hourly to fill in price snapshots at 6h, 24h, and 7d after each signal, then marks each call WIN or LOSS.
+1. **Collect**: scrapes r/wallstreetbets via the public `.json` endpoint. Fetches top hot/new posts plus up to 3000+ comments from the Daily Discussion thread. Posts not meeting flair, upvote ratio, or quality criteria are dropped.
+2. **Persist**: new posts and comments are written to a local SQLite database; already-seen items are skipped.
+3. **Analyse**: each new item is sent to Claude, which extracts ticker symbols, assigns sentiment (bullish/bearish/neutral), rates quality (1–5), returns a confidence score, and applies irony detection to flip sarcastic sentiment.
+4. **Generate signals**: analyses are grouped by ticker. Each item's weight is `upvotes × quality_score × confidence`. A BUY or SELL signal is emitted when 2+ posts agree and the dominant side holds 70%+ of total weighted sentiment.
+5. **Options recommendations**: for every signal, live options chains are fetched from yfinance targeting strikes ~5% OTM and expiry 14–30 days out, filtered for liquidity and annotated with IV warnings.
+6. **Paper trade**: signals are logged as simulated trades with the entry price recorded via yfinance. A 4-hour cooldown per ticker per direction prevents duplicate signals.
+7. **Track performance**: a background job runs hourly, fills in price snapshots at 6h, 24h, and 7d, and computes P&L. Trades move through a lifecycle: `PENDING → ACTIVE → CLOSED` (profit / loss / expiry / reversal).
 
 ---
 
@@ -24,17 +32,32 @@ Each pipeline cycle runs these stages in order:
 
 | File | Purpose |
 |---|---|
-| `main.py` | Entry point and scheduler; orchestrates the full pipeline |
-| `config.py` | All configurable constants; loads `.env` and validates required keys |
-| `collector.py` | Scrapes r/wallstreetbets via the public JSON API and applies post filters |
-| `analyzer.py` | Sends posts to Claude and parses structured analysis results |
-| `signals.py` | Aggregates analyses into weighted ticker-level BUY/SELL/HOLD signals |
-| `trader.py` | Records simulated trades and prints the per-run summary |
-| `performance.py` | Tracks signal outcomes at 6h / 24h / 7d using Yahoo Finance prices |
-| `database.py` | SQLite schema, all read/write helpers |
-| `options.py` | Options chain utilities (supporting module) |
+| `main.py` | Orchestrator and APScheduler entry point |
+| `config.py` | Environment variables and constants |
+| `database.py` | SQLite schema setup and migrations |
+| `collector.py` | Reddit scraping with deep comment fetching |
+| `analyzer.py` | Claude sentiment analysis with WSB cultural context |
+| `signals.py` | Weighted consensus signal generation |
+| `options.py` | Live options chain recommendations via yfinance |
+| `trader.py` | Simulated trade logging with cooldown system |
+| `performance.py` | Automated performance tracking and P&L |
+| `dashboard.py` | Flask web dashboard with live prices |
 | `requirements.txt` | Python dependencies |
-| `.env.example` | Template for the required environment variables |
+| `.env.example` | Template for required environment variables |
+
+---
+
+## Dashboard Features
+
+Served at `http://localhost:5000`.
+
+- **Today's Signals tab**: actionable signals with options recommendation cards and a stock view toggle
+- **Performance History tab**: results grouped by date with filter controls
+- **Live price ticker bar**: updates every 30 seconds for all tracked tickers
+- **Overall Avg Return** (stock) and **Options Avg Return** metrics in the header
+- **Total Hypothetical P&L** tracking across all closed trades
+- **Trade lifecycle status** badges: `ACTIVE` / `PENDING` / `REVERSED` / `CLOSED`
+- **Market status banner** indicating open, closed, after-hours, or weekend
 
 ---
 
@@ -54,94 +77,94 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Open `.env` and fill in your Anthropic API key. All other values have working defaults:
+**3. Add your Anthropic API key**
 
 ```env
 ANTHROPIC_API_KEY=your_anthropic_api_key_here
-
-# Reddit scraping (no API key needed — public .json endpoint)
-REDDIT_USER_AGENT=wsb-sentiment-bot/1.0 (educational)
-
-# Post filters
-MIN_UPVOTES=100
-MIN_UPVOTE_RATIO=0.70
-MIN_COMMENTS=20
-MIN_BODY_LENGTH=200
-
-# Analysis
-MIN_QUALITY_SCORE=4
-
-# Signal generation
-MIN_AGREEING_POSTS=3
-BULLISH_THRESHOLD=0.70
-BEARISH_THRESHOLD=0.70
-
-# Scheduler (minutes between pipeline runs)
-SCHEDULE_INTERVAL_MINUTES=15
-
-# Database
-DB_PATH=wsb_bot.db
-
-# Logging: DEBUG, INFO, WARNING, ERROR
-LOG_LEVEL=INFO
 ```
 
----
-
-## How to Run
+**4. Run the bot**
 
 ```bash
 python main.py
 ```
 
-The bot runs one pipeline cycle immediately on startup, then repeats every `SCHEDULE_INTERVAL_MINUTES` minutes. Press `Ctrl+C` to stop.
+**5. Open the dashboard**
+
+```
+http://localhost:5000
+```
+
+The bot runs one pipeline cycle immediately on startup, then repeats on the configured schedule. Press `Ctrl+C` to stop.
 
 ---
 
 ## Configuration
 
-All thresholds can be tuned via `.env` without touching any code.
+Key thresholds are set in `config.py` (and can be overridden via `.env`):
 
-| Variable | Default | What it does |
+| Setting | Value | Description |
 |---|---|---|
-| `MIN_UPVOTES` | `100` | Minimum upvotes a post must have to enter the pipeline |
-| `MIN_UPVOTE_RATIO` | `0.70` | Minimum ratio of upvotes to total votes (filters divisive posts) |
-| `MIN_COMMENTS` | `20` | Minimum comment count; low-engagement posts are skipped |
-| `MIN_BODY_LENGTH` | `200` | Minimum character count of the post body; filters thin posts |
-| `MIN_QUALITY_SCORE` | `4` | Minimum quality score (1–5) Claude must assign before a post influences signals |
-| `MIN_COMMENT_QUALITY_SCORE` | `2` | Same threshold applied to Daily Discussion comments (lower bar) |
-| `MIN_AGREEING_POSTS` | `3` | Number of posts that must agree on direction before a signal is generated |
-| `BULLISH_THRESHOLD` | `0.70` | Weighted-sentiment share (0–1) required to emit a BUY signal |
-| `BEARISH_THRESHOLD` | `0.70` | Weighted-sentiment share (0–1) required to emit a SELL signal |
-| `SCHEDULE_INTERVAL_MINUTES` | `15` | How often the pipeline runs |
-
-**Tuning tips:**
-- Raise `MIN_AGREEING_POSTS` or the threshold values for fewer but higher-conviction signals.
-- Lower `MIN_QUALITY_SCORE` to cast a wider net; raise it to filter out noise.
-- Increase `SCHEDULE_INTERVAL_MINUTES` to reduce API costs during quiet market periods.
+| `MIN_QUALITY_SCORE` | `3` | Minimum quality score for regular posts (1–5) |
+| `MIN_COMMENT_QUALITY_SCORE` | `2` | Lower quality threshold for Daily Discussion comments |
+| `MIN_AGREEING_POSTS` | `2` | Posts that must agree on direction to emit a signal |
+| `MIN_TOTAL_WEIGHT` | `20` | Minimum total weighted score to emit a signal (40 on weekends) |
+| `BULLISH_THRESHOLD` | `0.70` | Weighted share required to emit a BUY signal |
+| `BEARISH_THRESHOLD` | `0.70` | Weighted share required to emit a SELL signal |
+| Signal cooldown | `4 hours` | Per ticker per direction: prevents duplicate signals |
+| Options expiry target | `14–30 days` | Target DTE window for options recommendations |
+| IV warning threshold | `60%` | Orange IV warning; red above 80% |
 
 ---
 
 ## Performance Tracking
 
-Every simulated trade is inserted into the `performance` table at execution time, with the market price recorded as the entry price. A background job runs once per hour and checks three time-based snapshots:
+Every simulated trade gets price snapshots at three checkpoints:
 
 | Window | Meaning |
 |---|---|
-| **6h** | Price 6 hours after the signal — short-term reaction |
-| **24h** | Price 24 hours after the signal — primary outcome window |
-| **7d** | Price 7 days after the signal — medium-term trend |
+| **6h** | Early directional signal: short-term market reaction |
+| **24h** | Primary performance measure: next-day outcome |
+| **7d** | Longer-term outcome: medium-term trend confirmation |
 
-For each window, the bot fetches the current price via Yahoo Finance, computes the percentage change from entry, and marks the call **WIN** or **LOSS**:
-- A **BUY** signal wins if the price is higher at the measurement time.
-- A **SELL** signal wins if the price is lower.
+- Options P&L is calculated using live market prices from yfinance
+- SELL signal returns are sign-flipped so profit = positive in all cases
+- Overall Avg Return is audited and verified via the browser console on each dashboard load
+- Trades logged before the performance table existed are automatically backfilled on startup using historical closing prices
 
-The performance summary printed after every pipeline run shows total signals tracked, win rate (24h), best and worst calls, and a per-ticker breakdown with all three time-window results.
+---
 
-Trades logged before the performance table existed are automatically backfilled on startup using historical closing prices.
+## Signal Quality Filters
+
+Signals are filtered at multiple stages to reduce noise:
+
+- **Flair filter**: only DD, Discussion, News, and Earnings Thread flairs are processed
+- **Upvote ratio**: minimum 0.70 to filter divisive or brigaded posts
+- **Upvote floor**: posts require 100+ upvotes; comments require 2+
+- **Quality score**: Claude assigns 1–5; items below threshold are excluded
+- **Irony detection**: Claude identifies sarcasm and flips the sentiment accordingly
+- **Ticker normalization**: company names and common WSB shorthand are mapped to canonical symbols
+- **Ticker validation**: symbols are confirmed against yfinance before a signal is recorded
+
+---
+
+## Options Recommendations
+
+For each BUY/SELL signal, the bot fetches a live options recommendation:
+
+- **Strike**: ~5% OTM (calls for BUY, puts for SELL)
+- **Expiry**: nearest expiry in the 14–30 day window
+- **Liquidity filter**: open interest 100+, bid $0.10+
+- **IV warnings**: color-coded: orange at 60–80% IV, red above 80%
+- **Sizing**: conservative suggestion based on confidence score; max 1–2 contracts recommended
 
 ---
 
 ## Disclaimer
 
-**This project is for educational and research purposes only. It is not financial advice. All trades are simulated (paper trading only) — no real money is ever placed. Options trading carries a significant risk of total loss of capital. Past signal performance does not guarantee future results. Do not use this bot to make real investment decisions.**
+**This project is for educational and research purposes only. It is not financial advice. All trades are simulated (paper trading only): no real money is ever placed.**
+
+- Paper trade only until you have sufficient performance data to evaluate signal quality
+- Options trading carries a significant risk of total loss of capital
+- Past simulated performance does not guarantee future results
+- Always do your own research before trading real money
