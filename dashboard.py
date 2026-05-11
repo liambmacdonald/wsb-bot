@@ -788,7 +788,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Ne
   <!-- aggregate stats -->
   <div class="metrics-row" id="histStats">
     <div class="metric-card" id="hmc0">
-      <div class="metric-label">Avg 24h Return</div>
+      <div class="metric-label">Overall Avg Return</div>
       <div class="metric-value" id="hmv0">—</div>
       <div class="metric-sub" id="hms0">resolved signals</div>
     </div>
@@ -824,8 +824,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Ne
       <button class="filter-btn active" data-filter="ALL"     onclick="setFilter('ALL')">All</button>
       <button class="filter-btn"        data-filter="BUY"     onclick="setFilter('BUY')">BUY</button>
       <button class="filter-btn"        data-filter="SELL"    onclick="setFilter('SELL')">SELL</button>
-      <button class="filter-btn"        data-filter="WIN"     onclick="setFilter('WIN')">WIN</button>
-      <button class="filter-btn"        data-filter="LOSS"    onclick="setFilter('LOSS')">LOSS</button>
+      <button class="filter-btn"        data-filter="POSITIVE" onclick="setFilter('POSITIVE')">Positive</button>
+      <button class="filter-btn"        data-filter="NEGATIVE" onclick="setFilter('NEGATIVE')">Negative</button>
       <button class="filter-btn"        data-filter="PENDING" onclick="setFilter('PENDING')">PENDING</button>
       <span class="filter-count" id="filterCount"></span>
     </div>
@@ -1192,12 +1192,22 @@ function renderHistStats(rows) {
     if (p != null) { totalPnl += p; hasPnl = true; }
   });
 
-  // Avg 24h Return
+  // Overall Avg Return — best available checkpoint per trade, direction-adjusted for SELL
   const hmc0 = document.getElementById('hmc0'), hmv0 = document.getElementById('hmv0'), hms0 = document.getElementById('hms0');
-  document.querySelector('#hmc0 .metric-label').textContent = 'Avg 24h Return';
+  document.querySelector('#hmc0 .metric-label').textContent = 'Overall Avg Return';
   const resolvedForAvg = actionRows.filter(r => r.percent_change_24h != null || r.percent_change_6h != null);
-  const avgRet = resolvedForAvg.length
-    ? resolvedForAvg.reduce((sum, r) => sum + (r.percent_change_24h ?? r.percent_change_6h ?? 0), 0) / resolvedForAvg.length
+  // For SELL signals, effective return = -(raw percent change): price drop is positive
+  const effectiveReturns = resolvedForAvg.map(r => {
+    const raw = r.percent_change_24h ?? r.percent_change_6h;
+    return r.signal === 'SELL' ? -raw : raw;
+  });
+  console.log('[Overall Avg Return] resolved trades:', resolvedForAvg.map((r, i) => ({
+    ticker: r.ticker, signal: r.signal,
+    raw_pct: r.percent_change_24h ?? r.percent_change_6h,
+    effective_return: effectiveReturns[i]
+  })));
+  const avgRet = effectiveReturns.length
+    ? effectiveReturns.reduce((s, v) => s + v, 0) / effectiveReturns.length
     : null;
   if (avgRet != null) {
     const sign = avgRet >= 0 ? '+' : '';
@@ -1274,8 +1284,8 @@ function renderHistGroups(rows) {
       const stockOut6  = r.outcome_6h || 'PENDING';
       const stockOut24 = r.outcome    || 'PENDING';
       const stockEff   = stockOut24 !== 'PENDING' ? stockOut24 : stockOut6;
-      // Use stock outcome for filter, never show HOLD
-      const outData    = stockEff === 'WIN' ? 'WIN' : stockEff === 'LOSS' ? 'LOSS' : 'PENDING';
+      // Use direction-aware outcome for filter (WIN = positive return for both BUY and SELL)
+      const outData    = stockEff === 'WIN' ? 'POSITIVE' : stockEff === 'LOSS' ? 'NEGATIVE' : 'PENDING';
 
       // Trade status takes priority for row color when closed
       const tStatus = r.trade_status || 'PENDING';
@@ -1396,8 +1406,8 @@ function applyHistFilter() {
     let show = histFilter === 'ALL'
       || (histFilter === 'BUY'     && sig === 'BUY')
       || (histFilter === 'SELL'    && sig === 'SELL')
-      || (histFilter === 'WIN'     && out === 'WIN')
-      || (histFilter === 'LOSS'    && out === 'LOSS')
+      || (histFilter === 'POSITIVE' && out === 'POSITIVE')
+      || (histFilter === 'NEGATIVE' && out === 'NEGATIVE')
       || (histFilter === 'PENDING' && out === 'PENDING');
     row.style.display = show ? '' : 'none';
     if (show) visible++;
