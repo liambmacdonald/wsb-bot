@@ -14,10 +14,31 @@ of the dominant direction determines the final call:
 
 import logging
 from collections import defaultdict
+from datetime import datetime, timezone
 
 from config import BULLISH_THRESHOLD, BEARISH_THRESHOLD, MIN_AGREEING_POSTS
 
 logger = logging.getLogger(__name__)
+
+_MIN_WEIGHT_NORMAL  = 20.0
+_MIN_WEIGHT_WEEKEND = 40.0
+
+
+def _is_weekend() -> bool:
+    return datetime.now(timezone.utc).weekday() >= 5  # Sat=5, Sun=6
+
+
+def _is_after_hours() -> bool:
+    now = datetime.now(timezone.utc)
+    et_offset = -4 if 3 <= now.month <= 11 else -5
+    et_minutes = (now.hour * 60 + now.minute) + et_offset * 60
+    if et_minutes < 0:
+        et_minutes += 24 * 60
+    et_hour = et_minutes // 60
+    et_min  = et_minutes % 60
+    before_open = et_hour < 9 or (et_hour == 9 and et_min < 30)
+    after_close = et_hour >= 16
+    return before_open or after_close
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
@@ -83,10 +104,12 @@ def _build_ticker_buckets(
     return dict(buckets)
 
 
-def _generate_signal_for_ticker(ticker: str, entries: list[dict]) -> dict | None:
+def _generate_signal_for_ticker(
+    ticker: str, entries: list[dict], min_weight: float = _MIN_WEIGHT_NORMAL
+) -> dict | None:
     """
     Given all weighted entries for one ticker, compute a signal.
-    Returns a signal dict or None if the minimum-post threshold isn't met.
+    Returns a signal dict or None if the minimum-post or weight threshold isn't met.
     """
     bullish_entries = [e for e in entries if e["sentiment"] == "bullish"]
     bearish_entries = [e for e in entries if e["sentiment"] == "bearish"]
@@ -109,6 +132,13 @@ def _generate_signal_for_ticker(ticker: str, entries: list[dict]) -> dict | None
 
     if total_weight == 0:
         logger.warning("Ticker %s: total weight is zero — skipping", ticker)
+        return None
+
+    if total_weight < min_weight:
+        logger.info(
+            "Ticker %s: total weight %.1f below minimum %.1f — no signal",
+            ticker, total_weight, min_weight,
+        )
         return None
 
     bullish_share = bullish_weight / total_weight
@@ -175,16 +205,29 @@ def generate_signals(posts: list[dict], analyses: list[dict]) -> list[dict]:
         len(analyses), len(posts),
     )
 
-    buckets  = _build_ticker_buckets(posts, analyses)
+    buckets    = _build_ticker_buckets(posts, analyses)
     signals: list[dict] = []
+    weekend    = _is_weekend()
+    after_hrs  = _is_after_hours()
+    min_weight = _MIN_WEIGHT_WEEKEND if weekend else _MIN_WEIGHT_NORMAL
+
+    if weekend:
+        logger.info("Weekend mode: minimum weight raised to %.1f", _MIN_WEIGHT_WEEKEND)
+    if after_hrs:
+        logger.info("After-hours mode: signals will carry lower-confidence note")
 
     for ticker, entries in sorted(buckets.items()):
         logger.info(
             "Processing ticker %s: %d weighted entr%s",
             ticker, len(entries), "y" if len(entries) == 1 else "ies",
         )
-        sig = _generate_signal_for_ticker(ticker, entries)
+        sig = _generate_signal_for_ticker(ticker, entries, min_weight=min_weight)
         if sig:
+            if after_hrs:
+                sig["after_hours"] = True
+                sig["reasoning"] = sig["reasoning"] + " After Hours Signal — lower confidence."
+            else:
+                sig["after_hours"] = False
             signals.append(sig)
             logger.info("Signal generated: %s → %s", ticker, sig["signal"])
 

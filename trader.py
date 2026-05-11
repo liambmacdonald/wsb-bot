@@ -13,7 +13,11 @@ from datetime import datetime, timezone
 
 import yfinance as yf
 
-from database import save_signal, save_trade, insert_performance_row
+from database import (
+    save_signal, save_trade, insert_performance_row,
+    get_recent_trade_for_ticker, save_hold,
+    get_latest_active_performance_row, update_trade_status,
+)
 from options import format_recommendation, get_options_recommendation
 
 logger = logging.getLogger(__name__)
@@ -94,6 +98,50 @@ def execute_signals(signals: list[dict]) -> list[dict]:
         action = signal.get("signal", "HOLD")
         total_weight = signal.get("total_weight", 0.0)
 
+        # ── HOLD signals: console only, log to holds_log, skip trades/performance ──
+        if action == "HOLD":
+            print(_format_signal_block(signal, None))
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            save_hold(
+                ticker=ticker,
+                signal_timestamp=ts,
+                total_weight=signal.get("total_weight"),
+                bullish_weight=signal.get("bullish_weight"),
+                bearish_weight=signal.get("bearish_weight"),
+                reasoning=signal.get("reasoning"),
+            )
+            logger.info("HOLD %s — logged to holds_log, skipping trade/performance", ticker)
+            continue
+
+        # ── Cooldown check: skip duplicate direction within 4h ─────────────────
+        recent = get_recent_trade_for_ticker(ticker, hours=4.0)
+        if recent is not None:
+            recent_action = recent["action"]
+            recent_ts     = recent["executed_at"]
+            if recent_action == action:
+                try:
+                    dt    = datetime.strptime(recent_ts, "%Y-%m-%d %H:%M:%S")
+                    age_h = (datetime.utcnow() - dt).total_seconds() / 3600
+                except Exception:
+                    age_h = 0.0
+                print(f"  [cooldown] Skipping {action} {ticker} — already logged {age_h:.1f}h ago")
+                logger.info("[cooldown] Skipping %s %s — already logged %.1fh ago", action, ticker, age_h)
+                save_signal(signal)  # record signal for reference, skip trade/perf
+                continue
+            else:
+                # Direction reversed — close the previous open trade
+                old_row = get_latest_active_performance_row(ticker)
+                if old_row is not None:
+                    update_trade_status(
+                        old_row["id"],
+                        "CLOSED_REVERSAL",
+                        close_reason=f"Bot issued opposite {action} signal",
+                    )
+                    logger.info(
+                        "CLOSED_REVERSAL: %s id=%d (was %s, now %s)",
+                        ticker, old_row["id"], recent_action, action,
+                    )
+
         # Persist the signal
         signal_id = save_signal(signal)
         if signal_id is None:
@@ -101,8 +149,6 @@ def execute_signals(signals: list[dict]) -> list[dict]:
             continue
 
         # Build the simulated trade
-        # signal_strength: normalised 0–1 score derived from the dominant
-        # weight share (a proxy for how decisive the signal is).
         b_weight  = signal.get("bullish_weight", 0.0)
         be_weight = signal.get("bearish_weight", 0.0)
         if total_weight > 0:
@@ -122,7 +168,6 @@ def execute_signals(signals: list[dict]) -> list[dict]:
         trade_id = save_trade(trade)
         if trade_id is None:
             logger.error("Failed to save trade for %s", ticker)
-            # Still print the signal even if DB write failed
         else:
             trade["id"] = trade_id
             trades.append(trade)
@@ -130,13 +175,12 @@ def execute_signals(signals: list[dict]) -> list[dict]:
                 "Simulated trade logged: id=%d  %s %s  strength=%.2f",
                 trade_id, action, ticker, signal_strength,
             )
-            if action in ("BUY", "SELL"):
-                price = _fetch_current_price(ticker)
-                ts    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                if price is not None:
-                    options_rec = get_options_recommendation(ticker, action, price, signal_strength)
-                insert_performance_row(ticker, action, ts, price, options_rec)
-                logger.debug("Performance row inserted for %s @ %s", ticker, price)
+            price = _fetch_current_price(ticker)
+            ts    = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            if price is not None:
+                options_rec = get_options_recommendation(ticker, action, price, signal_strength)
+            insert_performance_row(ticker, action, ts, price, options_rec)
+            logger.debug("Performance row inserted for %s @ %s", ticker, price)
 
         # Console output
         print(_format_signal_block(signal, trade_id))

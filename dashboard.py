@@ -64,20 +64,27 @@ def _market_status() -> dict:
     weekday = now.weekday()
     if (now.hour * 60 + now.minute) + et_offset * 60 < 0:
         weekday = (weekday - 1) % 7
+    is_weekend = weekday >= 5
     is_open = (
-        weekday < 5
+        not is_weekend
         and (et_hour > 9 or (et_hour == 9 and et_min >= 30))
         and et_hour < 16
     )
+    is_after_hours = (not is_weekend) and (not is_open)
     next_open = None
     if not is_open:
-        if weekday >= 5:
+        if is_weekend:
             next_open = "Monday 9:30am ET"
         elif et_hour >= 16:
             next_open = "Monday 9:30am ET" if weekday == 4 else "Tomorrow 9:30am ET"
         else:
             next_open = "Today 9:30am ET"
-    return {"open": is_open, "next_open": next_open}
+    return {
+        "open": is_open,
+        "next_open": next_open,
+        "is_weekend": is_weekend,
+        "is_after_hours": is_after_hours,
+    }
 
 
 # ── API ────────────────────────────────────────────────────────────────────────
@@ -100,30 +107,46 @@ def api_today():
               AND s.signal      = p.signal
               AND s.generated_at = p.signal_timestamp
             WHERE p.signal_timestamp >= datetime('now', '-24 hours')
+              AND p.signal IN ('BUY', 'SELL')
             ORDER BY p.signal_timestamp DESC
         """).fetchall()
 
-        result = []
+        # Count signals per ticker, then dedupe keeping highest total_weight
+        counts: dict[str, int] = {}
+        best: dict[str, dict] = {}
         for r in rows:
             d = dict(r)
+            t  = d["ticker"]
+            tw = float(d.get("total_weight") or 0)
+            counts[t] = counts.get(t, 0) + 1
+            if t not in best or tw > float(best[t].get("total_weight") or 0):
+                best[t] = d
+
+        result = []
+        for ticker, d in best.items():
+            d["signal_count"] = counts[ticker]
             bw = float(d.get("bullish_weight") or 0)
             sw = float(d.get("bearish_weight") or 0)
             tw = float(d.get("total_weight") or 0)
             if tw > 0:
-                if d["signal"] == "BUY":
-                    d["confidence"] = round(bw / tw, 3)
-                elif d["signal"] == "SELL":
-                    d["confidence"] = round(sw / tw, 3)
-                else:
-                    d["confidence"] = None
+                d["confidence"] = round(bw / tw if d["signal"] == "BUY" else sw / tw, 3)
             else:
                 d["confidence"] = None
             result.append(d)
 
+        result.sort(key=lambda x: float(x.get("total_weight") or 0), reverse=True)
+
         ms = _market_status()
-        return jsonify({"signals": result, "market_open": ms["open"], "next_open": ms["next_open"]})
+        return jsonify({
+            "signals": result,
+            "market_open": ms["open"],
+            "next_open": ms["next_open"],
+            "is_weekend": ms["is_weekend"],
+            "is_after_hours": ms["is_after_hours"],
+        })
     except Exception as e:
-        return jsonify({"signals": [], "market_open": False, "next_open": None, "error": str(e)})
+        return jsonify({"signals": [], "market_open": False, "next_open": None,
+                        "is_weekend": False, "is_after_hours": False, "error": str(e)})
     finally:
         conn.close()
 
@@ -133,7 +156,7 @@ def api_history():
     conn = _db()
     try:
         rows = conn.execute(
-            "SELECT * FROM performance ORDER BY signal_timestamp DESC LIMIT 500"
+            "SELECT * FROM performance WHERE signal IN ('BUY','SELL') ORDER BY signal_timestamp DESC LIMIT 500"
         ).fetchall()
         return jsonify([dict(r) for r in rows])
     except Exception:
@@ -163,7 +186,11 @@ def api_stats():
         pass
 
     try:
+        # Exclude HOLD rows from all stats
+        rows = [r for r in rows if r.get("signal") in ("BUY", "SELL")]
         total = len(rows)
+
+        # ── Stock win rates (only resolved checkpoints) ───────────────────────
         resolved_6h  = [r for r in rows if r.get("percent_change_6h") is not None]
         wins_6h      = sum(1 for r in resolved_6h if r.get("outcome_6h") == "WIN")
         win_rate_6h  = round(wins_6h / len(resolved_6h) * 100, 1) if resolved_6h else None
@@ -183,7 +210,8 @@ def api_stats():
                 best_call = {"ticker": best["ticker"], "pct": round(pct, 2), "signal": best["signal"]}
 
         def _opt_return(r):
-            for col in ("option_return_7d", "option_return_24h", "option_return_6h"):
+            for col in ("option_return_7d", "option_return_24h", "option_return_6h",
+                        "close_return_pct"):
                 v = r.get(col)
                 if v is not None:
                     return v
@@ -191,16 +219,21 @@ def api_stats():
 
         def _opt_profit(r):
             cost = r.get("option_cost")
-            for val_col, profit_col in [("option_value_7d","option_profit_7d"),("option_value_24h","option_profit_24h"),("option_value_6h","option_profit_6h")]:
+            for profit_col in ("close_profit_dollars", "option_profit_7d", "option_profit_24h", "option_profit_6h"):
                 stored = r.get(profit_col)
                 if stored is not None:
                     return stored
+            for val_col in ("close_option_value", "option_value_7d", "option_value_24h", "option_value_6h"):
                 val = r.get(val_col)
                 if val is not None and cost is not None:
                     return val - cost
             return None
 
-        resolved_opts = [r for r in rows if any(r.get(c) is not None for c in ("option_return_6h","option_return_24h","option_return_7d"))]
+        # Options win rate: trades with any resolved option return
+        resolved_opts = [r for r in rows if (
+            any(r.get(c) is not None for c in ("option_return_6h","option_return_24h","option_return_7d"))
+            or r.get("close_return_pct") is not None
+        )]
         best_option_return = None
         if resolved_opts:
             best_opt = max(resolved_opts, key=_opt_return)
@@ -219,6 +252,25 @@ def api_stats():
         total_buy_pnl      = _sum_profit(buy_opts)
         total_sell_pnl     = _sum_profit(sell_opts)
         total_combined_pnl = round(total_buy_pnl + total_sell_pnl, 2)
+
+        # ── Closed trades summary ─────────────────────────────────────────────
+        closed_rows    = [r for r in rows if (r.get("trade_status") or "").startswith("CLOSED")]
+        closed_profit  = [r for r in closed_rows if r.get("trade_status") == "CLOSED_PROFIT"]
+        closed_loss    = [r for r in closed_rows if r.get("trade_status") == "CLOSED_LOSS"]
+        closed_expiry  = [r for r in closed_rows if r.get("trade_status") == "CLOSED_EXPIRY"]
+        closed_rev     = [r for r in closed_rows if r.get("trade_status") == "CLOSED_REVERSAL"]
+        active_rows    = [r for r in rows if (r.get("trade_status") or "PENDING") == "ACTIVE"]
+        def _avg_ret(group):
+            vals = [r.get("close_return_pct") for r in group if r.get("close_return_pct") is not None]
+            return round(sum(vals) / len(vals), 1) if vals else None
+        closed_summary = {
+            "total": len(closed_rows),
+            "profit": len(closed_profit), "avg_profit_pct": _avg_ret(closed_profit),
+            "loss":   len(closed_loss),   "avg_loss_pct":   _avg_ret(closed_loss),
+            "expiry": len(closed_expiry),
+            "reversal": len(closed_rev),
+            "active": len(active_rows),
+        }
 
         now = datetime.now(timezone.utc)
         bot_state = "offline"
@@ -255,8 +307,10 @@ def api_stats():
 
         return jsonify({
             "total_signals": total,
-            "win_rate_6h": win_rate_6h,
-            "win_rate_24h": win_rate_24h,
+            "stock_win_rate_6h": win_rate_6h,
+            "stock_win_rate_24h": win_rate_24h,
+            "win_rate_6h": win_rate_6h,    # kept for back-compat
+            "win_rate_24h": win_rate_24h,  # kept for back-compat
             "best_call": best_call,
             "last_updated": last_updated,
             "bot_running": bot_state == "live",
@@ -273,6 +327,7 @@ def api_stats():
             "total_sell_pnl": total_sell_pnl,
             "total_combined_pnl": total_combined_pnl,
             "resolved_options_count": len(resolved_opts),
+            "closed_summary": closed_summary,
         })
     except Exception:
         return jsonify({"error": "stats computation failed", "total_signals": 0, "bot_state": "offline", "bot_running": False, "last_updated": "Error"})
@@ -484,6 +539,30 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Ne
 /* strong signal badge */
 .strong-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:100px;font-size:10px;font-weight:700;background:rgba(255,214,10,.15);color:var(--yellow);border:1px solid rgba(255,214,10,.3);letter-spacing:.04em;white-space:nowrap}
 
+/* confirming signals badge */
+.confirm-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:100px;font-size:10px;font-weight:600;background:rgba(10,132,255,.12);color:var(--blue);border:1px solid rgba(10,132,255,.25);white-space:nowrap}
+
+/* signal strength bar */
+.strength-bar-wrap{margin-top:10px}
+.strength-bar-label{display:flex;justify-content:space-between;font-size:10px;color:var(--text3);margin-bottom:4px}
+.strength-track{height:4px;background:rgba(255,255,255,.08);border-radius:100px;overflow:hidden}
+.strength-fill{height:100%;border-radius:100px;background:linear-gradient(90deg,var(--blue),var(--green));transition:width .4s ease}
+
+/* trade status badge colors */
+.b-closed-profit{background:rgba(48,209,88,.18);color:var(--green);border:1px solid rgba(48,209,88,.3)}
+.b-closed-loss{background:rgba(255,69,58,.18);color:var(--red);border:1px solid rgba(255,69,58,.3)}
+.b-closed-expiry{background:rgba(142,142,147,.14);color:#8E8E93;border:1px solid rgba(142,142,147,.25)}
+.b-closed-reversal{background:rgba(255,214,10,.14);color:var(--yellow);border:1px solid rgba(255,214,10,.25)}
+.b-active{background:rgba(10,132,255,.14);color:var(--blue)}
+
+/* closed trades summary */
+.closed-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
+.cs-item{background:rgba(255,255,255,.03);border:1px solid var(--border);border-radius:var(--rs);padding:12px 14px;text-align:center}
+.cs-num{font-size:24px;font-weight:200;letter-spacing:-1px;font-variant-numeric:tabular-nums}
+.cs-label{font-size:10px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--text3);margin-top:2px}
+.cs-sub{font-size:10px;color:var(--text3);margin-top:2px}
+@media(max-width:600px){.closed-summary{grid-template-columns:repeat(2,1fr)}}
+
 /* ── TODAY PAGE ────────────────────────────────────────────────────────────── */
 
 /* market banner */
@@ -659,8 +738,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Ne
     </div>
     <div class="ts-div"></div>
     <div class="ts-stat">
-      <span class="ts-num ts-hold" id="tsHold">0</span>
-      <span class="ts-label">HOLD</span>
+      <span class="ts-num" id="tsTotal" style="color:var(--text2)">0</span>
+      <span class="ts-label">TOTAL</span>
     </div>
   </div>
 
@@ -696,6 +775,15 @@ body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Ne
       <div class="metric-value" id="hmv3">—</div>
       <div class="metric-sub" id="hms3">1 contract each</div>
     </div>
+  </div>
+
+  <!-- closed trades summary -->
+  <div class="card" id="closedSummaryCard" style="display:none">
+    <div class="card-head">
+      <span class="card-title">Closed Trades</span>
+      <span class="card-badge" id="closedBadge">0 closed</span>
+    </div>
+    <div class="closed-summary" id="closedSummary"></div>
   </div>
 
   <!-- filter row -->
@@ -815,9 +903,43 @@ async function refreshStats() {
   if (d.last_posts_collected != null || d.last_signals_generated != null)
     document.getElementById('navRunStats').textContent = (d.last_posts_collected ?? '—') + ' posts · ' + (d.last_signals_generated ?? '—') + ' signals';
   document.getElementById('navTime').textContent = d.last_updated || '—';
+
+  // Closed trades summary card
+  const cs = d.closed_summary;
+  if (cs && cs.total > 0) {
+    document.getElementById('closedSummaryCard').style.display = '';
+    document.getElementById('closedBadge').textContent = cs.total + ' closed';
+    const avgP = cs.avg_profit_pct != null ? ' (avg +' + cs.avg_profit_pct.toFixed(1) + '%)' : '';
+    const avgL = cs.avg_loss_pct   != null ? ' (avg '  + cs.avg_loss_pct.toFixed(1) + '%)'  : '';
+    document.getElementById('closedSummary').innerHTML = `
+      <div class="cs-item"><div class="cs-num" style="color:var(--text)">${cs.total}</div><div class="cs-label">Total Closed</div></div>
+      <div class="cs-item"><div class="cs-num" style="color:var(--green)">${cs.profit}</div><div class="cs-label">At Profit</div><div class="cs-sub">${avgP}</div></div>
+      <div class="cs-item"><div class="cs-num" style="color:var(--red)">${cs.loss}</div><div class="cs-label">At Loss</div><div class="cs-sub">${avgL}</div></div>
+      <div class="cs-item"><div class="cs-num" style="color:var(--blue)">${cs.active}</div><div class="cs-label">Still Active</div></div>
+    `;
+  }
 }
 
 // ── Today's Signals ───────────────────────────────────────────────────────────
+
+function strengthBar(tw) {
+  const pct = Math.min(100, Math.round((tw / 60) * 100));
+  const label = tw >= 40 ? 'Strong' : tw >= 20 ? 'Moderate' : 'Weak';
+  return `<div class="strength-bar-wrap">
+    <div class="strength-bar-label"><span>Signal Strength</span><span>${label} (${Math.round(tw)} wt)</span></div>
+    <div class="strength-track"><div class="strength-fill" style="width:${pct}%"></div></div>
+  </div>`;
+}
+
+function statusBadge(r) {
+  const ts = r.trade_status || 'PENDING';
+  if (ts === 'CLOSED_PROFIT')   return '<span class="b b-closed-profit">CLOSED PROFIT</span>';
+  if (ts === 'CLOSED_LOSS')     return '<span class="b b-closed-loss">CLOSED LOSS</span>';
+  if (ts === 'CLOSED_EXPIRY')   return '<span class="b b-closed-expiry">EXPIRED</span>';
+  if (ts === 'CLOSED_REVERSAL') return '<span class="b b-closed-reversal">REVERSED</span>';
+  if (ts === 'ACTIVE')          return '<span class="b b-active">ACTIVE</span>';
+  return '';
+}
 
 async function refreshToday() {
   const data = await get('/api/today');
@@ -826,25 +948,34 @@ async function refreshToday() {
     return;
   }
 
-  const { signals, market_open, next_open } = data;
+  const { signals, market_open, next_open, is_weekend, is_after_hours } = data;
 
   // market banner
   const banner = document.getElementById('marketBanner');
-  if (!market_open) {
+  const bannerText = document.getElementById('marketBannerText');
+  if (is_weekend) {
     banner.style.display = 'flex';
-    const next = next_open ? ' · Next open ' + next_open : '';
-    document.getElementById('marketBannerText').innerHTML = 'Market Closed<span>' + next + '</span>';
+    bannerText.innerHTML = 'Markets Closed — Weekend Discussion Active<span> · Next open ' + (next_open || 'Monday 9:30am ET') + '</span>';
+  } else if (is_after_hours) {
+    banner.style.display = 'flex';
+    bannerText.innerHTML = 'Markets Closed — After Hours<span> · Signals are for tomorrow\'s open · Next open ' + (next_open || 'Tomorrow 9:30am ET') + '</span>';
+  } else if (market_open) {
+    banner.style.display = 'flex';
+    banner.style.background = 'rgba(48,209,88,.07)';
+    banner.style.borderColor = 'rgba(48,209,88,.2)';
+    banner.style.color = 'var(--green)';
+    document.querySelector('.market-banner-icon').textContent = '🟢';
+    bannerText.innerHTML = 'Markets Open — <span>Live Signals</span>';
   } else {
     banner.style.display = 'none';
   }
 
-  // summary counts
+  // summary counts (BUY/SELL only — no HOLD)
   const buys  = signals.filter(s => s.signal === 'BUY').length;
   const sells = signals.filter(s => s.signal === 'SELL').length;
-  const holds = signals.filter(s => s.signal === 'HOLD').length;
-  document.getElementById('tsBuy').textContent  = buys;
-  document.getElementById('tsSell').textContent = sells;
-  document.getElementById('tsHold').textContent = holds;
+  document.getElementById('tsBuy').textContent   = buys;
+  document.getElementById('tsSell').textContent  = sells;
+  document.getElementById('tsTotal').textContent = signals.length;
 
   const grid = document.getElementById('todayGrid');
   if (!signals.length) {
@@ -853,27 +984,28 @@ async function refreshToday() {
   }
 
   grid.innerHTML = signals.map((r, i) => {
-    const sigCls = r.signal === 'BUY' ? 'sc-buy' : r.signal === 'SELL' ? 'sc-sell' : 'sc-hold';
+    const sigCls   = r.signal === 'BUY' ? 'sc-buy' : 'sc-sell';
     const dirBadge = r.signal === 'BUY'
       ? '<span class="b b-buy">BUY</span>'
-      : r.signal === 'SELL'
-      ? '<span class="b b-sell">SELL</span>'
-      : '<span class="b b-hold">HOLD</span>';
+      : '<span class="b b-sell">SELL</span>';
     const strongBadge = (r.confidence != null && r.confidence >= 0.80)
-      ? '<span class="strong-badge">★ Strong Signal</span>'
-      : '';
+      ? '<span class="strong-badge">★ Strong Signal</span>' : '';
+    const confirmBadge = (r.signal_count > 1)
+      ? `<span class="confirm-badge">${r.signal_count} confirming signals</span>` : '';
+    const ahBadge = r.after_hours
+      ? '<span class="b-warn b" style="font-size:9.5px">After Hours</span>' : '';
     const when = timeAgo(r.signal_timestamp);
-    const tk = (r.ticker || '').replace(/[^A-Z0-9.]/g, '');
+    const tk   = (r.ticker || '').replace(/[^A-Z0-9.]/g, '');
+    const tw   = r.total_weight || 0;
 
-    // option section
     let optHtml = '';
     if (r.option_contract) {
-      const strike  = r.option_strike  ? '$' + Number(r.option_strike).toFixed(0) : '—';
-      const expiry  = r.option_expiry  || '—';
-      const cost    = r.option_cost    ? '$' + Number(r.option_cost).toFixed(2)   : '—';
-      const iv      = r.option_iv      ? (r.option_iv * 100).toFixed(0) + '%'     : '—';
-      const delta   = r.option_delta   ? Number(r.option_delta).toFixed(2)        : '—';
-      const ivCls   = r.option_iv && r.option_iv > 0.8 ? 'dn' : '';
+      const strike = r.option_strike  ? '$' + Number(r.option_strike).toFixed(0) : '—';
+      const expiry = r.option_expiry  || '—';
+      const cost   = r.option_cost    ? '$' + Number(r.option_cost).toFixed(2)   : '—';
+      const iv     = r.option_iv      ? (r.option_iv * 100).toFixed(0) + '%'     : '—';
+      const delta  = r.option_delta   ? Number(r.option_delta).toFixed(2)        : '—';
+      const ivCls  = r.option_iv && r.option_iv > 0.8 ? 'dn' : '';
       optHtml = `<div class="sig-card-opt">
         <div class="sig-card-opt-title">${r.option_type || '?'} ${strike} · exp ${expiry}</div>
         <div class="sig-card-metas">
@@ -885,7 +1017,6 @@ async function refreshToday() {
       </div>`;
     }
 
-    // entry + live price row
     const entryStr = r.price_at_signal != null ? '$' + Number(r.price_at_signal).toFixed(2) : '—';
     const priceRow = `<div class="sig-card-prices">
       Entry <span>${entryStr}</span>
@@ -893,28 +1024,25 @@ async function refreshToday() {
       &nbsp;<span class="chg-cell" data-ticker="${tk}"></span>
     </div>`;
 
-    // outcome chips
     let outcomes = [];
     if (r.percent_change_6h != null) {
-      const cls = r.outcome_6h === 'WIN' ? 'b-win' : 'b-loss';
+      const cls  = r.outcome_6h === 'WIN' ? 'b-win' : 'b-loss';
       const sign = r.percent_change_6h >= 0 ? '+' : '';
       outcomes.push(`<span class="sco-item"><span class="sco-label">6h</span><span class="b ${cls}">${sign}${Number(r.percent_change_6h).toFixed(2)}%</span></span>`);
     } else {
       outcomes.push('<span class="sco-item"><span class="sco-label">6h</span><span class="b b-pending">PENDING</span></span>');
     }
     if (r.percent_change_24h != null) {
-      const cls = r.outcome === 'WIN' ? 'b-win' : 'b-loss';
+      const cls  = r.outcome === 'WIN' ? 'b-win' : 'b-loss';
       const sign = r.percent_change_24h >= 0 ? '+' : '';
       outcomes.push(`<span class="sco-item"><span class="sco-label">24h</span><span class="b ${cls}">${sign}${Number(r.percent_change_24h).toFixed(2)}%</span></span>`);
     } else {
       outcomes.push('<span class="sco-item"><span class="sco-label">24h</span><span class="b b-pending">PENDING</span></span>');
     }
-
-    // option outcome
     const optRet = r.option_return_7d ?? r.option_return_24h ?? r.option_return_6h;
     if (optRet != null) {
-      const sign = optRet >= 0 ? '+' : '';
-      const cls  = optRet >= 0 ? 'b-win' : 'b-loss';
+      const sign      = optRet >= 0 ? '+' : '';
+      const cls       = optRet >= 0 ? 'b-win' : 'b-loss';
       const optProfit = r.option_profit_7d ?? r.option_profit_24h ?? r.option_profit_6h;
       const profitStr = optProfit != null ? ' (' + (optProfit >= 0 ? '+$' : '-$') + Math.abs(optProfit).toFixed(0) + ')' : '';
       outcomes.push(`<span class="sco-item"><span class="sco-label">Opt</span><span class="b ${cls}">${sign}${optRet.toFixed(1)}%${profitStr}</span></span>`);
@@ -924,14 +1052,15 @@ async function refreshToday() {
       <div class="sig-card-head">
         <div class="sig-card-left">
           <span class="sig-card-ticker">${r.ticker}</span>
-          ${dirBadge}
-          ${strongBadge}
+          ${dirBadge}${strongBadge}${ahBadge}${confirmBadge}
         </div>
         <span class="sig-card-when">${when}</span>
       </div>
+      ${strengthBar(tw)}
       ${optHtml}
       ${priceRow}
       <div class="sig-card-outcomes">${outcomes.join('')}</div>
+      ${statusBadge(r) ? '<div style="margin-top:8px">' + statusBadge(r) + '</div>' : ''}
     </div>`;
   }).join('');
 }
@@ -950,40 +1079,54 @@ async function refreshHistory() {
 }
 
 function renderHistStats(rows) {
-  const resolved24 = rows.filter(r => r.percent_change_24h != null);
-  const resolvedAny = rows.filter(r => r.percent_change_24h != null || r.percent_change_6h != null);
+  // Only count BUY/SELL for win rates
+  const actionRows  = rows.filter(r => r.signal === 'BUY' || r.signal === 'SELL');
+  const resolved6h  = actionRows.filter(r => r.percent_change_6h != null);
+  const wins6h      = resolved6h.filter(r => r.outcome_6h === 'WIN').length;
+  const wr6h        = resolved6h.length ? (wins6h / resolved6h.length * 100).toFixed(1) : null;
+  const resolvedAny = actionRows.filter(r => r.percent_change_24h != null || r.percent_change_6h != null);
 
-  function bestPct(r) { return r.percent_change_24h ?? r.percent_change_6h ?? -Infinity; }
+  function bestPct(r)  { return r.percent_change_24h ?? r.percent_change_6h ?? -Infinity; }
   function worstPct(r) { return r.percent_change_24h ?? r.percent_change_6h ?? Infinity; }
 
-  const wins24  = resolved24.filter(r => r.outcome === 'WIN').length;
-  const wr      = resolved24.length ? (wins24 / resolved24.length * 100).toFixed(1) : null;
-  const best    = resolvedAny.length ? resolvedAny.reduce((a,b) => bestPct(a) >= bestPct(b) ? a : b) : null;
-  const worst   = resolvedAny.length ? resolvedAny.reduce((a,b) => worstPct(a) <= worstPct(b) ? a : b) : null;
+  const best  = resolvedAny.length ? resolvedAny.reduce((a,b) => bestPct(a)  >= bestPct(b)  ? a : b) : null;
+  const worst = resolvedAny.length ? resolvedAny.reduce((a,b) => worstPct(a) <= worstPct(b) ? a : b) : null;
 
   let totalPnl = 0, hasPnl = false;
-  rows.forEach(r => {
-    const p = r.option_profit_7d ?? r.option_profit_24h ?? r.option_profit_6h;
+  actionRows.forEach(r => {
+    const p = r.close_profit_dollars ?? r.option_profit_7d ?? r.option_profit_24h ?? r.option_profit_6h;
     if (p != null) { totalPnl += p; hasPnl = true; }
   });
 
+  // Stock win rate
   const hmc0 = document.getElementById('hmc0'), hmv0 = document.getElementById('hmv0'), hms0 = document.getElementById('hms0');
-  if (wr != null) {
-    hmv0.textContent = wr + '%';
-    hmc0.className = 'metric-card ' + (parseFloat(wr) >= 50 ? 'c-green' : 'c-red');
-    hms0.textContent = resolved24.length + ' resolved';
-  } else { hmv0.textContent = 'N/A'; hmc0.className = 'metric-card'; hms0.textContent = 'no resolved signals'; }
+  if (wr6h != null) {
+    hmv0.textContent = wr6h + '%';
+    hmc0.className = 'metric-card ' + (parseFloat(wr6h) >= 50 ? 'c-green' : 'c-red');
+    hms0.textContent = 'Stock win rate · ' + resolved6h.length + ' resolved';
+  } else { hmv0.textContent = 'N/A'; hmc0.className = 'metric-card'; hms0.textContent = 'Stock win rate · no resolved signals'; }
 
+  // Options win rate
+  const optRows = actionRows.filter(r =>
+    r.close_return_pct != null ||
+    r.option_return_6h != null || r.option_return_24h != null || r.option_return_7d != null
+  );
+  const optWins = optRows.filter(r => (r.close_return_pct ?? r.option_return_7d ?? r.option_return_24h ?? r.option_return_6h ?? 0) > 0).length;
+  const optWR   = optRows.length ? (optWins / optRows.length * 100).toFixed(1) : null;
+  // Re-use metric-card 1 as Options Win Rate
   const hmc1 = document.getElementById('hmc1'), hmv1 = document.getElementById('hmv1'), hms1 = document.getElementById('hms1');
-  if (best) {
-    const p = bestPct(best); hmv1.textContent = best.ticker; hmc1.className = 'metric-card c-green';
-    hms1.textContent = (p >= 0 ? '+' : '') + p.toFixed(2) + '% · ' + best.signal;
-  } else { hmv1.textContent = 'N/A'; hmc1.className = 'metric-card'; hms1.textContent = 'no data'; }
+  document.querySelector('#hmc1 .metric-label').textContent = 'Options Win Rate';
+  if (optWR != null) {
+    hmv1.textContent = optWR + '%';
+    hmc1.className = 'metric-card ' + (parseFloat(optWR) >= 50 ? 'c-green' : 'c-red');
+    hms1.textContent = optRows.length + ' resolved options';
+  } else { hmv1.textContent = 'N/A'; hmc1.className = 'metric-card'; hms1.textContent = 'Options win rate · no data'; }
 
   const hmc2 = document.getElementById('hmc2'), hmv2 = document.getElementById('hmv2'), hms2 = document.getElementById('hms2');
-  if (worst) {
-    const p = worstPct(worst); hmv2.textContent = worst.ticker; hmc2.className = 'metric-card c-red';
-    hms2.textContent = (p >= 0 ? '+' : '') + p.toFixed(2) + '% · ' + worst.signal;
+  document.querySelector('#hmc2 .metric-label').textContent = 'Best Call';
+  if (best) {
+    const p = bestPct(best); hmv2.textContent = best.ticker; hmc2.className = 'metric-card c-green';
+    hms2.textContent = (p >= 0 ? '+' : '') + p.toFixed(2) + '% · ' + best.signal;
   } else { hmv2.textContent = 'N/A'; hmc2.className = 'metric-card'; hms2.textContent = 'no data'; }
 
   const hmc3 = document.getElementById('hmc3'), hmv3 = document.getElementById('hmv3'), hms3 = document.getElementById('hms3');
@@ -1016,9 +1159,9 @@ function renderHistGroups(rows) {
 
   const container = document.getElementById('histGroups');
   container.innerHTML = sortedDates.map(date => {
-    const grpRows = groups[date];
-    const wins    = grpRows.filter(r => (r.outcome === 'WIN' || r.outcome_6h === 'WIN')).length;
-    const losses  = grpRows.filter(r => (r.outcome === 'LOSS' || r.outcome_6h === 'LOSS')).length;
+    const grpRows = groups[date].filter(r => r.signal === 'BUY' || r.signal === 'SELL');
+    const wins    = grpRows.filter(r => r.outcome === 'WIN' || r.outcome_6h === 'WIN').length;
+    const losses  = grpRows.filter(r => r.outcome === 'LOSS' || r.outcome_6h === 'LOSS').length;
     const pending = grpRows.filter(r => r.outcome === 'PENDING' && r.outcome_6h !== 'WIN' && r.outcome_6h !== 'LOSS').length;
     const isOpen  = openGroups.has(date);
 
@@ -1026,45 +1169,56 @@ function renderHistGroups(rows) {
     const lossChip    = losses  ? `<span class="dg-oc loss">${losses} LOSS</span>`  : '';
     const pendingChip = pending ? `<span class="dg-oc pending">${pending} PENDING</span>` : '';
 
-    const tableRows = grpRows.map((r, i) => {
-      const stockOut24 = r.outcome    || 'PENDING';
+    const tableRows = grpRows.filter(r => r.signal === 'BUY' || r.signal === 'SELL').map((r, i) => {
+      // Stock outcome drives filter tags — never classify 0% as LOSS
       const stockOut6  = r.outcome_6h || 'PENDING';
+      const stockOut24 = r.outcome    || 'PENDING';
       const stockEff   = stockOut24 !== 'PENDING' ? stockOut24 : stockOut6;
-      const optRet  = r.option_return_7d  ?? r.option_return_24h  ?? r.option_return_6h;
-      const optVal  = r.option_value_7d   ?? r.option_value_24h   ?? r.option_value_6h;
-      const optCost = r.option_cost;
-      const optSrc  = r.option_price_source;
-      const optEff  = optRet == null ? 'PENDING' : optRet > 0 ? 'WIN' : 'LOSS';
-      const eff     = r.option_contract ? optEff : stockEff;
-      const trCls   = eff === 'WIN' ? 't-win' : eff === 'LOSS' ? 't-loss' : 't-pending';
-      const outData = eff === 'WIN' ? 'WIN' : eff === 'LOSS' ? 'LOSS' : 'PENDING';
+      // Use stock outcome for filter, never show HOLD
+      const outData    = stockEff === 'WIN' ? 'WIN' : stockEff === 'LOSS' ? 'LOSS' : 'PENDING';
+
+      // Trade status takes priority for row color when closed
+      const tStatus = r.trade_status || 'PENDING';
+      let trCls = 't-pending';
+      if (tStatus === 'CLOSED_PROFIT')   trCls = 't-win';
+      else if (tStatus === 'CLOSED_LOSS') trCls = 't-loss';
+      else if (stockEff === 'WIN')        trCls = 't-win';
+      else if (stockEff === 'LOSS')       trCls = 't-loss';
 
       const dirBadge = r.signal === 'BUY'
         ? '<span class="b b-buy">BUY</span>'
-        : r.signal === 'SELL'
-        ? '<span class="b b-sell">SELL</span>'
-        : '<span class="b b-hold">HOLD</span>';
+        : '<span class="b b-sell">SELL</span>';
 
-      const outBadge = eff === 'WIN'
-        ? '<span class="b b-win">WIN</span>'
-        : eff === 'LOSS'
-        ? '<span class="b b-loss">LOSS</span>'
-        : '<span class="b b-pending">PENDING</span>';
+      // Outcome/status badge: prefer trade_status when closed
+      let outBadge;
+      if (tStatus === 'CLOSED_PROFIT')   outBadge = '<span class="b b-closed-profit">CLOSED PROFIT</span>';
+      else if (tStatus === 'CLOSED_LOSS') outBadge = '<span class="b b-closed-loss">CLOSED LOSS</span>';
+      else if (tStatus === 'CLOSED_EXPIRY') outBadge = '<span class="b b-closed-expiry">EXPIRED</span>';
+      else if (tStatus === 'CLOSED_REVERSAL') outBadge = '<span class="b b-closed-reversal">REVERSED</span>';
+      else if (tStatus === 'ACTIVE')      outBadge = '<span class="b b-active">ACTIVE</span>';
+      else if (stockEff === 'WIN')        outBadge = '<span class="b b-win">WIN</span>';
+      else if (stockEff === 'LOSS')       outBadge = '<span class="b b-loss">LOSS</span>';
+      else                                outBadge = '<span class="b b-pending">PENDING</span>';
+
+      const optRet  = r.close_return_pct ?? r.option_return_7d ?? r.option_return_24h ?? r.option_return_6h;
+      const optVal  = r.close_option_value ?? r.option_value_7d ?? r.option_value_24h ?? r.option_value_6h;
+      const optCost = r.option_cost;
+      const optSrc  = r.option_price_source;
 
       const opt = r.option_contract
         ? `<span title="${r.option_contract}">${r.option_type || '?'}&nbsp;$${r.option_strike || '?'}</span>`
         : '<span class="neu">—</span>';
 
       let optRetHtml = '<span class="neu">—</span>';
-      if (optRet != null && optCost != null) {
-        const profit = optVal != null ? optVal - optCost : null;
+      if (optRet != null) {
+        const profit = r.close_profit_dollars ?? (optVal != null && optCost != null ? optVal - optCost : null);
         const cls    = optRet >= 0 ? 'up' : 'dn';
         const sign   = optRet >= 0 ? '+' : '';
         let str = `<span class="${cls}">${sign}${optRet.toFixed(1)}%`;
-        if (profit != null) str += `<br><small>${profit >= 0 ? '+' : ''}$${Math.abs(profit).toFixed(0)}</small>`;
+        if (profit != null) str += `<br><small>${profit >= 0 ? '+$' : '-$'}${Math.abs(profit).toFixed(0)}</small>`;
         if (optSrc) {
-          const srcMap = {live:'Live',intrinsic:'At Expiry',estimate:'Est.',expired:'Expired'};
-          const srcCls = optSrc === 'live' ? 'up' : optSrc === 'expired' ? 'dn' : 'neu';
+          const srcMap = {live:'Live',intrinsic:'At Expiry',estimate:'Est.'};
+          const srcCls = optSrc === 'live' ? 'up' : optSrc === 'intrinsic' ? 'dn' : 'neu';
           str += `<br><small class="${srcCls}" style="font-size:9px">${srcMap[optSrc]||optSrc}</small>`;
         }
         str += '</span>';

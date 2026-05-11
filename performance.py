@@ -23,6 +23,8 @@ from database import (
     get_all_performance_rows,
     get_untracked_trades,
     insert_performance_row,
+    get_active_options_rows,
+    update_trade_status,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,9 +71,10 @@ def _fetch_historical_price(ticker: str, timestamp_str: str) -> float | None:
 # ── Outcome logic ─────────────────────────────────────────────────────────────
 
 def _outcome(signal: str, pct_change: float) -> str:
+    # A 0% move is not a loss — treat it as a win (price didn't go against the trade).
     if signal == "BUY":
-        return "WIN" if pct_change > 0 else "LOSS"
-    return "WIN" if pct_change < 0 else "LOSS"   # SELL wins when price drops
+        return "WIN" if pct_change >= 0 else "LOSS"
+    return "WIN" if pct_change <= 0 else "LOSS"   # SELL wins when price drops
 
 
 def _safe_float(val, default: float = 0.0) -> float:
@@ -187,8 +190,104 @@ def _option_perf(
 
     option_return = ((option_value - cost) / cost) * 100
     option_profit = option_value - cost
-    outcome = "WIN" if option_profit > 0 else "LOSS"
+    # Only classify WIN/LOSS for expired options; active options carry no verdict yet.
+    if source == "intrinsic":
+        outcome = "WIN" if option_profit > 0 else "LOSS"
+    else:
+        outcome = None
     return round(option_value, 2), round(option_return, 4), round(option_profit, 2), outcome, source
+
+
+# ── Options trade lifecycle ───────────────────────────────────────────────────
+
+def _auto_close_if_needed(row: dict) -> None:
+    """Apply auto-close rules to a single active options trade row."""
+    trade_id = row["id"]
+    ticker   = row["ticker"]
+    opt_cost = row.get("option_cost") or 0.0
+
+    opt_return = (row.get("option_return_7d")
+                  or row.get("option_return_24h")
+                  or row.get("option_return_6h"))
+    opt_value  = (row.get("option_value_7d")
+                  or row.get("option_value_24h")
+                  or row.get("option_value_6h"))
+
+    if opt_return is None:
+        current_price = _fetch_price(ticker)
+        if current_price is None:
+            return
+        opt_val, opt_ret, opt_prf, _, _ = _option_perf(row, current_price)
+        if opt_ret is None:
+            return
+        opt_return, opt_value = opt_ret, opt_val
+        opt_profit = opt_prf
+    else:
+        opt_profit = (row.get("option_profit_7d")
+                      or row.get("option_profit_24h")
+                      or row.get("option_profit_6h"))
+
+    if opt_return >= 100.0:
+        update_trade_status(
+            trade_id, "CLOSED_PROFIT",
+            close_reason="Take profit: option up ≥+100%",
+            close_option_value=opt_value,
+            close_return_pct=opt_return,
+            close_profit_dollars=opt_profit,
+        )
+        logger.info("CLOSED_PROFIT: %s id=%d (return=%.1f%%)", ticker, trade_id, opt_return)
+        return
+
+    if opt_return <= -50.0:
+        update_trade_status(
+            trade_id, "CLOSED_LOSS",
+            close_reason="Stop loss: option down ≤-50%",
+            close_option_value=opt_value,
+            close_return_pct=opt_return,
+            close_profit_dollars=opt_profit,
+        )
+        logger.info("CLOSED_LOSS: %s id=%d (return=%.1f%%)", ticker, trade_id, opt_return)
+        return
+
+    expiry_str = row.get("option_expiry")
+    if expiry_str:
+        try:
+            expiry_date = datetime.strptime(expiry_str[:10], "%Y-%m-%d").date()
+            days_left   = (expiry_date - datetime.utcnow().date()).days
+            if days_left <= 3:
+                current_price = _fetch_price(ticker) or (row.get("price_at_signal") or 0.0)
+                strike    = row.get("option_strike") or 0.0
+                opt_type  = (row.get("option_type") or "CALL").upper()
+                intrinsic = (max(0.0, current_price - strike) if opt_type == "CALL"
+                             else max(0.0, strike - current_price)) * 100
+                exp_ret    = ((intrinsic - opt_cost) / opt_cost * 100) if opt_cost else 0.0
+                exp_profit = intrinsic - opt_cost
+                update_trade_status(
+                    trade_id, "CLOSED_EXPIRY",
+                    close_reason=f"Expiry approaching ({days_left}d remaining)",
+                    close_price=current_price,
+                    close_option_value=intrinsic,
+                    close_return_pct=exp_ret,
+                    close_profit_dollars=exp_profit,
+                )
+                logger.info("CLOSED_EXPIRY: %s id=%d (%d days left)", ticker, trade_id, days_left)
+                return
+        except ValueError:
+            pass
+
+    # Still active — ensure status is ACTIVE
+    if (row.get("trade_status") or "PENDING") == "PENDING":
+        update_trade_status(trade_id, "ACTIVE")
+
+
+def _check_options_lifecycle() -> None:
+    """Run auto-close checks on all active options trades."""
+    rows = get_active_options_rows()
+    for row in rows:
+        try:
+            _auto_close_if_needed(row)
+        except Exception as exc:
+            logger.warning("Lifecycle check failed for id=%s: %s", row.get("id"), exc)
 
 
 # ── Public: update ────────────────────────────────────────────────────────────
@@ -272,6 +371,8 @@ def update_performance() -> None:
         "%d 24h updates, %d 7d updates",
         already_resolved_6h, updated_6h, updated_24h, updated_7d,
     )
+
+    _check_options_lifecycle()
 
 
 # ── Public: summary ───────────────────────────────────────────────────────────

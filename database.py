@@ -31,43 +31,61 @@ CREATE TABLE IF NOT EXISTS bot_status (
 );
 
 CREATE TABLE IF NOT EXISTS performance (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    ticker              TEXT NOT NULL,
-    signal              TEXT NOT NULL,
-    signal_timestamp    TEXT NOT NULL,
-    price_at_signal     REAL,
-    price_6h_later      REAL,
-    price_24h_later     REAL,
-    price_7d_later      REAL,
-    outcome_6h          TEXT NOT NULL DEFAULT 'PENDING',
-    outcome             TEXT NOT NULL DEFAULT 'PENDING',
-    percent_change_6h   REAL,
-    percent_change_24h  REAL,
-    percent_change_7d   REAL,
-    option_type         TEXT,
-    option_contract     TEXT,
-    option_strike       REAL,
-    option_expiry       TEXT,
-    option_last         REAL,
-    option_bid          REAL,
-    option_ask          REAL,
-    option_iv           REAL,
-    option_delta        REAL,
-    option_oi           INTEGER,
-    option_cost         REAL,
-    option_breakeven    REAL,
-    option_value_6h     REAL,
-    option_return_6h    REAL,
-    option_profit_6h    REAL,
-    option_outcome_6h   TEXT,
-    option_value_24h    REAL,
-    option_return_24h   REAL,
-    option_profit_24h   REAL,
-    option_outcome_24h  TEXT,
-    option_value_7d     REAL,
-    option_return_7d    REAL,
-    option_profit_7d    REAL,
-    option_outcome_7d   TEXT
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker               TEXT NOT NULL,
+    signal               TEXT NOT NULL,
+    signal_timestamp     TEXT NOT NULL,
+    price_at_signal      REAL,
+    price_6h_later       REAL,
+    price_24h_later      REAL,
+    price_7d_later       REAL,
+    outcome_6h           TEXT NOT NULL DEFAULT 'PENDING',
+    outcome              TEXT NOT NULL DEFAULT 'PENDING',
+    percent_change_6h    REAL,
+    percent_change_24h   REAL,
+    percent_change_7d    REAL,
+    option_type          TEXT,
+    option_contract      TEXT,
+    option_strike        REAL,
+    option_expiry        TEXT,
+    option_last          REAL,
+    option_bid           REAL,
+    option_ask           REAL,
+    option_iv            REAL,
+    option_delta         REAL,
+    option_oi            INTEGER,
+    option_cost          REAL,
+    option_breakeven     REAL,
+    option_value_6h      REAL,
+    option_return_6h     REAL,
+    option_profit_6h     REAL,
+    option_outcome_6h    TEXT,
+    option_value_24h     REAL,
+    option_return_24h    REAL,
+    option_profit_24h    REAL,
+    option_outcome_24h   TEXT,
+    option_value_7d      REAL,
+    option_return_7d     REAL,
+    option_profit_7d     REAL,
+    option_outcome_7d    TEXT,
+    trade_status         TEXT NOT NULL DEFAULT 'PENDING',
+    close_reason         TEXT,
+    close_price          REAL,
+    close_option_value   REAL,
+    close_return_pct     REAL,
+    close_profit_dollars REAL,
+    closed_at            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS holds_log (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticker           TEXT NOT NULL,
+    signal_timestamp TEXT NOT NULL,
+    total_weight     REAL,
+    bullish_weight   REAL,
+    bearish_weight   REAL,
+    reasoning        TEXT,
+    logged_at        TEXT DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_performance_ticker  ON performance(ticker);
@@ -142,6 +160,9 @@ def init_db() -> None:
         _migrate_performance_options_profit(conn)
         _migrate_performance_option_source(conn)
         _migrate_bot_status(conn)
+        _migrate_holds_log(conn)
+        _migrate_performance_trade_status(conn)
+        _migrate_remove_holds_from_performance(conn)
     logger.info("Database initialised at '%s'", DB_PATH)
 
 
@@ -227,6 +248,43 @@ def _migrate_performance_option_source(conn: sqlite3.Connection) -> None:
     existing = {row[1] for row in conn.execute("PRAGMA table_info(performance)").fetchall()}
     if "option_price_source" not in existing:
         conn.execute("ALTER TABLE performance ADD COLUMN option_price_source TEXT")
+
+
+def _migrate_holds_log(conn: sqlite3.Connection) -> None:
+    """Create holds_log table if it doesn't exist (for pre-existing DBs)."""
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS holds_log (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker           TEXT NOT NULL,
+            signal_timestamp TEXT NOT NULL,
+            total_weight     REAL,
+            bullish_weight   REAL,
+            bearish_weight   REAL,
+            reasoning        TEXT,
+            logged_at        TEXT DEFAULT (datetime('now'))
+        );
+    """)
+
+
+def _migrate_performance_trade_status(conn: sqlite3.Connection) -> None:
+    """Add trade lifecycle columns to an existing performance table."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(performance)").fetchall()}
+    for col, defn in [
+        ("trade_status",         "TEXT NOT NULL DEFAULT 'PENDING'"),
+        ("close_reason",         "TEXT"),
+        ("close_price",          "REAL"),
+        ("close_option_value",   "REAL"),
+        ("close_return_pct",     "REAL"),
+        ("close_profit_dollars", "REAL"),
+        ("closed_at",            "TEXT"),
+    ]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE performance ADD COLUMN {col} {defn}")
+
+
+def _migrate_remove_holds_from_performance(conn: sqlite3.Connection) -> None:
+    """Remove HOLD signal rows from performance — HOLDs now go to holds_log."""
+    conn.execute("DELETE FROM performance WHERE signal = 'HOLD'")
 
 
 @contextmanager
@@ -586,6 +644,101 @@ def get_untracked_trades() -> list[dict]:
     """
     with _connect() as conn:
         return [dict(r) for r in conn.execute(sql).fetchall()]
+
+
+def save_hold(
+    ticker: str,
+    signal_timestamp: str,
+    total_weight: float | None = None,
+    bullish_weight: float | None = None,
+    bearish_weight: float | None = None,
+    reasoning: str | None = None,
+) -> int | None:
+    """Persist a HOLD signal to holds_log (not to trades/performance)."""
+    sql = """
+        INSERT INTO holds_log (ticker, signal_timestamp, total_weight, bullish_weight, bearish_weight, reasoning)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """
+    try:
+        with _connect() as conn:
+            cur = conn.execute(sql, (ticker, signal_timestamp, total_weight, bullish_weight, bearish_weight, reasoning))
+            return cur.lastrowid
+    except Exception as exc:
+        logger.error("save_hold failed for %s: %s", ticker, exc)
+        return None
+
+
+def get_recent_trade_for_ticker(ticker: str, hours: float = 4.0) -> dict | None:
+    """Return the most recent BUY/SELL trade for a ticker in the last `hours` hours."""
+    sql = """
+        SELECT action, executed_at FROM simulated_trades
+        WHERE ticker = ?
+          AND action IN ('BUY', 'SELL')
+          AND executed_at >= datetime('now', ?)
+        ORDER BY executed_at DESC
+        LIMIT 1
+    """
+    with _connect() as conn:
+        row = conn.execute(sql, (ticker, f"-{hours} hours")).fetchone()
+    return dict(row) if row else None
+
+
+def get_latest_active_performance_row(ticker: str) -> dict | None:
+    """Return the most recent non-closed performance row for a ticker."""
+    sql = """
+        SELECT * FROM performance
+        WHERE ticker = ?
+          AND signal IN ('BUY', 'SELL')
+          AND (trade_status IS NULL OR trade_status NOT LIKE 'CLOSED_%')
+        ORDER BY signal_timestamp DESC
+        LIMIT 1
+    """
+    with _connect() as conn:
+        row = conn.execute(sql, (ticker,)).fetchone()
+    return dict(row) if row else None
+
+
+def get_active_options_rows() -> list[dict]:
+    """Return performance rows with options data that are not yet closed."""
+    sql = """
+        SELECT * FROM performance
+        WHERE option_contract IS NOT NULL
+          AND option_cost IS NOT NULL
+          AND option_cost > 0
+          AND (trade_status IS NULL OR trade_status IN ('PENDING', 'ACTIVE'))
+        ORDER BY signal_timestamp DESC
+    """
+    with _connect() as conn:
+        return [dict(r) for r in conn.execute(sql).fetchall()]
+
+
+def update_trade_status(
+    row_id: int,
+    trade_status: str,
+    close_reason: str | None = None,
+    close_price: float | None = None,
+    close_option_value: float | None = None,
+    close_return_pct: float | None = None,
+    close_profit_dollars: float | None = None,
+) -> None:
+    """Update the trade lifecycle status and optional close details."""
+    sql = """
+        UPDATE performance
+        SET trade_status         = ?,
+            close_reason         = ?,
+            close_price          = ?,
+            close_option_value   = ?,
+            close_return_pct     = ?,
+            close_profit_dollars = ?,
+            closed_at            = CASE WHEN ? LIKE 'CLOSED_%' THEN datetime('now') ELSE closed_at END
+        WHERE id = ?
+    """
+    try:
+        with _connect() as conn:
+            conn.execute(sql, (trade_status, close_reason, close_price, close_option_value,
+                               close_return_pct, close_profit_dollars, trade_status, row_id))
+    except Exception as exc:
+        logger.error("update_trade_status failed for id=%s: %s", row_id, exc)
 
 
 def get_pipeline_stats() -> dict:
