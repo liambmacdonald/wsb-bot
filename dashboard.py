@@ -1,7 +1,7 @@
 """
-WSB Bot web dashboard — Apple-inspired single-page app on port 5000.
-Call dashboard.start() from main.py to launch in a background thread.
-Call dashboard.set_last_run() after each pipeline cycle to update the status pill.
+WSB Bot web dashboard — Apple dark theme, two-page SPA on port 5000.
+Page 1: Today's Signals  (last 24h, actionable)
+Page 2: Performance History  (all signals, grouped by date, filterable)
 """
 
 import sqlite3
@@ -53,6 +53,33 @@ def _fetch_price(ticker: str) -> tuple[str, float | None]:
     return ticker, None
 
 
+def _market_status() -> dict:
+    now = datetime.now(timezone.utc)
+    et_offset = -4 if 3 <= now.month <= 11 else -5
+    et_minutes = (now.hour * 60 + now.minute) + et_offset * 60
+    if et_minutes < 0:
+        et_minutes += 24 * 60
+    et_hour = et_minutes // 60
+    et_min  = et_minutes % 60
+    weekday = now.weekday()
+    if (now.hour * 60 + now.minute) + et_offset * 60 < 0:
+        weekday = (weekday - 1) % 7
+    is_open = (
+        weekday < 5
+        and (et_hour > 9 or (et_hour == 9 and et_min >= 30))
+        and et_hour < 16
+    )
+    next_open = None
+    if not is_open:
+        if weekday >= 5:
+            next_open = "Monday 9:30am ET"
+        elif et_hour >= 16:
+            next_open = "Monday 9:30am ET" if weekday == 4 else "Tomorrow 9:30am ET"
+        else:
+            next_open = "Today 9:30am ET"
+    return {"open": is_open, "next_open": next_open}
+
+
 # ── API ────────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -60,9 +87,63 @@ def index():
     return Response(DASHBOARD_HTML, mimetype="text/html")
 
 
+@app.route("/api/today")
+def api_today():
+    conn = _db()
+    try:
+        rows = conn.execute("""
+            SELECT p.*,
+                   s.bullish_weight, s.bearish_weight, s.total_weight
+            FROM performance p
+            LEFT JOIN signals s
+              ON  s.ticker      = p.ticker
+              AND s.signal      = p.signal
+              AND s.generated_at = p.signal_timestamp
+            WHERE p.signal_timestamp >= datetime('now', '-24 hours')
+            ORDER BY p.signal_timestamp DESC
+        """).fetchall()
+
+        result = []
+        for r in rows:
+            d = dict(r)
+            bw = float(d.get("bullish_weight") or 0)
+            sw = float(d.get("bearish_weight") or 0)
+            tw = float(d.get("total_weight") or 0)
+            if tw > 0:
+                if d["signal"] == "BUY":
+                    d["confidence"] = round(bw / tw, 3)
+                elif d["signal"] == "SELL":
+                    d["confidence"] = round(sw / tw, 3)
+                else:
+                    d["confidence"] = None
+            else:
+                d["confidence"] = None
+            result.append(d)
+
+        ms = _market_status()
+        return jsonify({"signals": result, "market_open": ms["open"], "next_open": ms["next_open"]})
+    except Exception as e:
+        return jsonify({"signals": [], "market_open": False, "next_open": None, "error": str(e)})
+    finally:
+        conn.close()
+
+
+@app.route("/api/history")
+def api_history():
+    conn = _db()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM performance ORDER BY signal_timestamp DESC LIMIT 500"
+        ).fetchall()
+        return jsonify([dict(r) for r in rows])
+    except Exception:
+        return jsonify([])
+    finally:
+        conn.close()
+
+
 @app.route("/api/stats")
 def api_stats():
-    # ── DB fetch ────────────────────────────────────────────────────────────────
     rows: list[dict] = []
     bot_status_row: dict | None = None
     try:
@@ -81,44 +162,36 @@ def api_stats():
     except Exception:
         pass
 
-    # ── Computation ─────────────────────────────────────────────────────────────
     try:
         total = len(rows)
-
-        resolved_6h = [r for r in rows if r.get("percent_change_6h") is not None]
-        wins_6h = sum(1 for r in resolved_6h if r.get("outcome_6h") == "WIN")
-        win_rate_6h = round(wins_6h / len(resolved_6h) * 100, 1) if resolved_6h else None
-
+        resolved_6h  = [r for r in rows if r.get("percent_change_6h") is not None]
+        wins_6h      = sum(1 for r in resolved_6h if r.get("outcome_6h") == "WIN")
+        win_rate_6h  = round(wins_6h / len(resolved_6h) * 100, 1) if resolved_6h else None
         resolved_24h = [r for r in rows if r.get("percent_change_24h") is not None]
-        wins_24h = sum(1 for r in resolved_24h if r.get("outcome") == "WIN")
+        wins_24h     = sum(1 for r in resolved_24h if r.get("outcome") == "WIN")
         win_rate_24h = round(wins_24h / len(resolved_24h) * 100, 1) if resolved_24h else None
 
-        best_call = None
-        def _pct(r: dict) -> float:
+        def _pct(r):
             return r.get("percent_change_24h") or r.get("percent_change_6h") or 0.0
 
         resolved_any = [r for r in rows if r.get("percent_change_24h") is not None or r.get("percent_change_6h") is not None]
+        best_call = None
         if resolved_any:
             best = max(resolved_any, key=_pct)
-            pct = _pct(best)
+            pct  = _pct(best)
             if pct > 0:
                 best_call = {"ticker": best["ticker"], "pct": round(pct, 2), "signal": best["signal"]}
 
-        # ── Option P&L stats ────────────────────────────────────────────────────
-        def _opt_return(r: dict) -> float:
+        def _opt_return(r):
             for col in ("option_return_7d", "option_return_24h", "option_return_6h"):
                 v = r.get(col)
                 if v is not None:
                     return v
             return 0.0
 
-        def _opt_profit(r: dict) -> float | None:
+        def _opt_profit(r):
             cost = r.get("option_cost")
-            for val_col, profit_col in [
-                ("option_value_7d", "option_profit_7d"),
-                ("option_value_24h", "option_profit_24h"),
-                ("option_value_6h", "option_profit_6h"),
-            ]:
+            for val_col, profit_col in [("option_value_7d","option_profit_7d"),("option_value_24h","option_profit_24h"),("option_value_6h","option_profit_6h")]:
                 stored = r.get(profit_col)
                 if stored is not None:
                     return stored
@@ -127,25 +200,16 @@ def api_stats():
                     return val - cost
             return None
 
-        resolved_opts = [
-            r for r in rows
-            if any(r.get(c) is not None for c in ("option_return_6h", "option_return_24h", "option_return_7d"))
-        ]
-
+        resolved_opts = [r for r in rows if any(r.get(c) is not None for c in ("option_return_6h","option_return_24h","option_return_7d"))]
         best_option_return = None
         if resolved_opts:
             best_opt = max(resolved_opts, key=_opt_return)
-            opt_pct = _opt_return(best_opt)
+            opt_pct  = _opt_return(best_opt)
             best_option_return = {"ticker": best_opt["ticker"], "pct": round(opt_pct, 2), "signal": best_opt["signal"]}
 
-        avg_option_return = (
-            round(sum(_opt_return(r) for r in resolved_opts) / len(resolved_opts), 1)
-            if resolved_opts else None
-        )
-
-        opt_wins = sum(1 for r in resolved_opts if _opt_return(r) > 0)
+        avg_option_return = (round(sum(_opt_return(r) for r in resolved_opts) / len(resolved_opts), 1) if resolved_opts else None)
+        opt_wins      = sum(1 for r in resolved_opts if _opt_return(r) > 0)
         option_win_rate = round(opt_wins / len(resolved_opts) * 100, 1) if resolved_opts else None
-
         buy_opts  = [r for r in resolved_opts if r.get("signal") == "BUY"]
         sell_opts = [r for r in resolved_opts if r.get("signal") == "SELL"]
 
@@ -157,13 +221,11 @@ def api_stats():
         total_combined_pnl = round(total_buy_pnl + total_sell_pnl, 2)
 
         now = datetime.now(timezone.utc)
-
-        # Determine bot state from DB heartbeat, falling back to in-memory _last_run
         bot_state = "offline"
         minutes_since_heartbeat = None
-        minutes_until_next_run = None
-        last_updated = "Never"
-        last_run_duration = None
+        minutes_until_next_run  = None
+        last_updated  = "Never"
+        last_run_duration    = None
         last_posts_collected = None
         last_signals_generated = None
 
@@ -178,15 +240,15 @@ def api_stats():
                 hb = datetime.fromisoformat(hb_str).replace(tzinfo=timezone.utc)
                 age_mins = (now - hb).total_seconds() / 60
                 minutes_since_heartbeat = round(age_mins, 1)
-                minutes_until_next_run = max(0, round(SCHEDULE_INTERVAL_MINUTES - age_mins, 1))
+                minutes_until_next_run  = max(0, round(SCHEDULE_INTERVAL_MINUTES - age_mins, 1))
                 last_updated = hb.strftime("%Y-%m-%d %H:%M UTC")
                 if age_mins < 20:
                     bot_state = "live"
                 elif age_mins < 60:
                     bot_state = "idle"
                 if bot_status_row:
-                    last_run_duration = bot_status_row.get("last_run_duration")
-                    last_posts_collected = bot_status_row.get("last_posts_collected")
+                    last_run_duration      = bot_status_row.get("last_run_duration")
+                    last_posts_collected   = bot_status_row.get("last_posts_collected")
                     last_signals_generated = bot_status_row.get("last_signals_generated")
             except Exception:
                 pass
@@ -213,20 +275,14 @@ def api_stats():
             "resolved_options_count": len(resolved_opts),
         })
     except Exception:
-        return jsonify({
-            "error": "stats computation failed", "total_signals": 0,
-            "bot_state": "offline", "bot_running": False,
-            "last_updated": "Error",
-        })
+        return jsonify({"error": "stats computation failed", "total_signals": 0, "bot_state": "offline", "bot_running": False, "last_updated": "Error"})
 
 
 @app.route("/api/performance")
 def api_performance():
     conn = _db()
     try:
-        rows = conn.execute(
-            "SELECT * FROM performance ORDER BY signal_timestamp DESC LIMIT 100"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM performance ORDER BY signal_timestamp DESC LIMIT 100").fetchall()
         return jsonify([dict(r) for r in rows])
     except Exception:
         return jsonify([])
@@ -239,23 +295,15 @@ def api_options():
     conn = _db()
     try:
         recs = conn.execute("""
-            SELECT * FROM performance
-            WHERE option_contract IS NOT NULL
-            ORDER BY signal_timestamp DESC
-            LIMIT 15
+            SELECT * FROM performance WHERE option_contract IS NOT NULL
+            ORDER BY signal_timestamp DESC LIMIT 15
         """).fetchall()
         warnings = conn.execute("""
             SELECT * FROM performance
-            WHERE option_iv IS NOT NULL
-              AND option_iv > 0.8
-              AND outcome = 'PENDING'
-            ORDER BY option_iv DESC
-            LIMIT 10
+            WHERE option_iv IS NOT NULL AND option_iv > 0.8 AND outcome = 'PENDING'
+            ORDER BY option_iv DESC LIMIT 10
         """).fetchall()
-        return jsonify({
-            "recommendations": [dict(r) for r in recs],
-            "iv_warnings": [dict(r) for r in warnings],
-        })
+        return jsonify({"recommendations": [dict(r) for r in recs], "iv_warnings": [dict(r) for r in warnings]})
     except Exception:
         return jsonify({"recommendations": [], "iv_warnings": []})
     finally:
@@ -268,9 +316,7 @@ def api_signals():
     try:
         rows = conn.execute("""
             SELECT ticker, signal, generated_at, bullish_weight, bearish_weight, total_weight
-            FROM signals
-            ORDER BY generated_at DESC
-            LIMIT 40
+            FROM signals ORDER BY generated_at DESC LIMIT 40
         """).fetchall()
         return jsonify([dict(r) for r in rows])
     except Exception:
@@ -282,7 +328,6 @@ def api_signals():
 @app.route("/api/prices")
 def api_prices():
     global _price_cache, _price_cache_ts
-
     now = time.time()
     with _price_lock:
         if now - _price_cache_ts < 25 and _price_cache:
@@ -290,9 +335,7 @@ def api_prices():
 
     conn = _db()
     try:
-        rows = conn.execute(
-            "SELECT ticker, price_at_signal FROM performance ORDER BY signal_timestamp DESC"
-        ).fetchall()
+        rows = conn.execute("SELECT ticker, price_at_signal FROM performance ORDER BY signal_timestamp DESC").fetchall()
     except Exception:
         return jsonify([])
     finally:
@@ -309,7 +352,6 @@ def api_prices():
 
     tickers = list(entry_prices.keys())
     prices: dict[str, float | None] = {}
-
     with ThreadPoolExecutor(max_workers=min(len(tickers), 8)) as ex:
         future_map = {ex.submit(_fetch_price, t): t for t in tickers}
         try:
@@ -325,16 +367,11 @@ def api_prices():
     result = []
     for t in tickers:
         try:
-            curr = prices.get(t)
+            curr  = prices.get(t)
             entry = entry_prices.get(t)
             if curr is not None:
                 pct = round((curr - entry) / entry * 100, 2) if entry else None
-                result.append({
-                    "ticker": t,
-                    "price": round(curr, 2),
-                    "change_pct": pct,
-                    "entry_price": entry,
-                })
+                result.append({"ticker": t, "price": round(curr, 2), "change_pct": pct, "entry_price": entry})
         except Exception:
             pass
 
@@ -348,11 +385,9 @@ def api_prices():
 # ── Server ─────────────────────────────────────────────────────────────────────
 
 def start() -> None:
-    """Launch Flask in a daemon thread on port 5000."""
     import logging
     log = logging.getLogger("werkzeug")
     log.setLevel(logging.ERROR)
-
     thread = threading.Thread(
         target=lambda: app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False),
         daemon=True,
@@ -372,382 +407,70 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <title>WSB Bot</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
-
 :root{
-  --bg:#000000;
-  --bg2:#1C1C1E;
-  --bg3:#2C2C2E;
-  --green:#30D158;
-  --red:#FF453A;
-  --blue:#0A84FF;
-  --yellow:#FFD60A;
-  --orange:#FF9F0A;
-  --text:#FFFFFF;
-  --text2:rgba(255,255,255,0.6);
-  --text3:rgba(255,255,255,0.28);
-  --border:rgba(255,255,255,0.1);
-  --glass:rgba(255,255,255,0.05);
-  --shadow:0 4px 24px rgba(0,0,0,0.5);
-  --r:16px;
-  --rs:10px;
+  --bg:#000;--bg2:#1C1C1E;--bg3:#2C2C2E;
+  --green:#30D158;--red:#FF453A;--blue:#0A84FF;
+  --yellow:#FFD60A;--orange:#FF9F0A;
+  --text:#fff;--text2:rgba(255,255,255,.6);--text3:rgba(255,255,255,.28);
+  --border:rgba(255,255,255,.1);--glass:rgba(255,255,255,.05);
+  --shadow:0 4px 24px rgba(0,0,0,.5);--r:16px;--rs:10px;
 }
+html{font-size:16px;-webkit-font-smoothing:antialiased}
+body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Neue',Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
 
-html{
-  font-size:16px;
-  -webkit-font-smoothing:antialiased;
-  -moz-osx-font-smoothing:grayscale;
-}
+/* progress */
+.progress-track{position:fixed;top:0;left:0;right:0;height:2px;background:rgba(255,255,255,.06);z-index:2000;overflow:hidden}
+.progress-fill{height:100%;width:100%;background:linear-gradient(90deg,var(--blue),rgba(10,132,255,.4));transform-origin:left center}
+.progress-fill.run{animation:prog 30s linear forwards}
+@keyframes prog{from{width:100%}to{width:0%}}
 
-body{
-  font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Neue',Arial,sans-serif;
-  background:var(--bg);
-  color:var(--text);
-  min-height:100vh;
-}
-
-/* ── Progress bar ─────────────────────────────────────────────────────────── */
-.progress-track{
-  position:fixed;
-  top:0;left:0;right:0;
-  height:2px;
-  background:rgba(255,255,255,0.06);
-  z-index:2000;
-  overflow:hidden;
-}
-.progress-fill{
-  height:100%;
-  width:100%;
-  background:linear-gradient(90deg,var(--blue),rgba(10,132,255,0.4));
-  transform-origin:left center;
-}
-.progress-fill.run{
-  animation:prog 30s linear forwards;
-}
-@keyframes prog{
-  from{width:100%}
-  to{width:0%}
-}
-
-/* ── Nav ──────────────────────────────────────────────────────────────────── */
-.nav{
-  position:fixed;
-  top:2px;left:0;right:0;
-  height:52px;
-  background:rgba(0,0,0,0.75);
-  backdrop-filter:blur(24px) saturate(180%);
-  -webkit-backdrop-filter:blur(24px) saturate(180%);
-  border-bottom:1px solid var(--border);
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  padding:0 28px;
-  z-index:1000;
-}
+/* nav */
+.nav{position:fixed;top:2px;left:0;right:0;height:52px;background:rgba(0,0,0,.75);backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 24px;z-index:1000}
 .nav-left{display:flex;align-items:center;gap:0}
-.nav-right{display:flex;align-items:center;gap:20px}
-.nav-logo{
-  font-size:15px;
-  font-weight:700;
-  letter-spacing:-0.4px;
-  color:var(--text);
-}
+.nav-right{display:flex;align-items:center;gap:16px}
+.nav-logo{font-size:15px;font-weight:700;letter-spacing:-.4px}
 .nav-logo span{color:var(--blue)}
-.nav-sep{
-  width:1px;height:18px;
-  background:var(--border);
-  margin:0 16px;
-}
-.status-pill{
-  display:inline-flex;
-  align-items:center;
-  gap:7px;
-  background:rgba(48,209,88,0.1);
-  border:1px solid rgba(48,209,88,0.22);
-  border-radius:100px;
-  padding:4px 11px;
-  font-size:12px;
-  font-weight:500;
-  color:var(--green);
-  transition:all .3s ease;
-}
-.status-pill.offline{
-  background:rgba(255,69,58,0.1);
-  border-color:rgba(255,69,58,0.22);
-  color:var(--red);
-}
-.status-dot{
-  width:6px;height:6px;
-  background:var(--green);
-  border-radius:50%;
-  animation:pulse 2.4s ease-in-out infinite;
-}
-.status-pill.offline .status-dot{
-  background:var(--red);
-  animation:none;
-}
-.status-pill.idle{
-  background:rgba(255,214,10,0.1);
-  border-color:rgba(255,214,10,0.22);
-  color:var(--yellow);
-}
-.status-pill.idle .status-dot{
-  background:var(--yellow);
-  animation:none;
-}
-@keyframes pulse{
-  0%,100%{opacity:1;transform:scale(1)}
-  50%{opacity:.5;transform:scale(.7)}
-}
-.nav-time{
-  font-size:12px;
-  color:var(--text3);
-  font-variant-numeric:tabular-nums;
-  letter-spacing:0.01em;
-}
-.nav-stat{
-  font-size:11px;
-  color:var(--text3);
-  white-space:nowrap;
-  letter-spacing:0.01em;
-}
+.nav-sep{width:1px;height:18px;background:var(--border);margin:0 14px}
+.status-pill{display:inline-flex;align-items:center;gap:7px;background:rgba(48,209,88,.1);border:1px solid rgba(48,209,88,.22);border-radius:100px;padding:4px 11px;font-size:12px;font-weight:500;color:var(--green);transition:all .3s}
+.status-pill.offline{background:rgba(255,69,58,.1);border-color:rgba(255,69,58,.22);color:var(--red)}
+.status-pill.idle{background:rgba(255,214,10,.1);border-color:rgba(255,214,10,.22);color:var(--yellow)}
+.status-dot{width:6px;height:6px;background:var(--green);border-radius:50%;animation:pulse 2.4s ease-in-out infinite}
+.status-pill.offline .status-dot{background:var(--red);animation:none}
+.status-pill.idle .status-dot{background:var(--yellow);animation:none}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.5;transform:scale(.7)}}
+.nav-stat{font-size:11px;color:var(--text3);white-space:nowrap;letter-spacing:.01em}
+.prices-live{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--text3);user-select:none}
+.pl-dot{width:6px;height:6px;background:var(--green);border-radius:50%;flex-shrink:0;animation:pulse 2.4s ease-in-out infinite}
+.pl-dot.flash{animation:pl-flash .6s ease-out forwards}
+@keyframes pl-flash{0%{opacity:1;transform:scale(2.2);background:#fff}60%{transform:scale(1.4);background:var(--green)}100%{opacity:1;transform:scale(1);background:var(--green)}}
+.nav-time{font-size:12px;color:var(--text3);font-variant-numeric:tabular-nums;letter-spacing:.01em}
 
-/* ── Prices live indicator ────────────────────────────────────────────────── */
-.prices-live{
-  display:inline-flex;
-  align-items:center;
-  gap:6px;
-  font-size:11px;
-  color:var(--text3);
-  letter-spacing:.02em;
-  user-select:none;
-}
-.pl-dot{
-  width:6px;height:6px;
-  background:var(--green);
-  border-radius:50%;
-  flex-shrink:0;
-  animation:pulse 2.4s ease-in-out infinite;
-}
-.pl-dot.flash{
-  animation:pl-flash .6s ease-out forwards;
-}
-@keyframes pl-flash{
-  0%{opacity:1;transform:scale(2.2);background:#ffffff}
-  60%{transform:scale(1.4);background:var(--green)}
-  100%{opacity:1;transform:scale(1);background:var(--green)}
-}
+/* tab bar */
+.tab-bar{position:fixed;top:54px;left:0;right:0;height:44px;background:rgba(0,0,0,.88);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:center;gap:6px;z-index:998;padding:0 24px}
+.tab-btn{padding:7px 22px;border-radius:8px;font-size:13px;font-weight:500;color:var(--text2);cursor:pointer;border:none;background:transparent;transition:all .18s ease;letter-spacing:-.1px;white-space:nowrap}
+.tab-btn.active{background:var(--blue);color:#fff}
+.tab-btn:hover:not(.active){background:rgba(255,255,255,.08);color:var(--text)}
 
-/* ── Ticker bar ───────────────────────────────────────────────────────────── */
-.ticker-bar{
-  position:fixed;
-  top:54px;left:0;right:0;
-  height:30px;
-  background:rgba(0,0,0,0.9);
-  backdrop-filter:blur(12px);
-  -webkit-backdrop-filter:blur(12px);
-  border-bottom:1px solid var(--border);
-  overflow:hidden;
-  z-index:999;
-  display:flex;
-  align-items:center;
-}
-.ticker-track{
-  display:inline-flex;
-  align-items:center;
-  white-space:nowrap;
-  will-change:transform;
-}
-@keyframes ticker-scroll{
-  from{transform:translateX(0)}
-  to{transform:translateX(-50%)}
-}
-.ti-item{
-  display:inline-flex;
-  align-items:center;
-  gap:4px;
-  padding:0 18px;
-  font-size:11.5px;
-  font-variant-numeric:tabular-nums;
-}
-.ti-ticker{
-  font-weight:700;
-  font-size:12px;
-  letter-spacing:-.1px;
-  color:var(--text);
-}
+/* ticker bar */
+.ticker-bar{position:fixed;top:98px;left:0;right:0;height:30px;background:rgba(0,0,0,.9);backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);border-bottom:1px solid var(--border);overflow:hidden;z-index:997;display:flex;align-items:center}
+.ticker-track{display:inline-flex;align-items:center;white-space:nowrap;will-change:transform}
+@keyframes ticker-scroll{from{transform:translateX(0)}to{transform:translateX(-50%)}}
+.ti-item{display:inline-flex;align-items:center;gap:4px;padding:0 18px;font-size:11.5px;font-variant-numeric:tabular-nums}
+.ti-ticker{font-weight:700;font-size:12px;letter-spacing:-.1px;color:var(--text)}
 .ti-sep{color:var(--text3);padding:0 4px;font-size:10px}
 .ti-arrow{font-size:8px;line-height:1}
 
-/* ── Layout ───────────────────────────────────────────────────────────────── */
-.main{
-  padding:94px 24px 52px;
-  max-width:1440px;
-  margin:0 auto;
-  display:flex;
-  flex-direction:column;
-  gap:20px;
-}
+/* layout */
+.main{padding:148px 24px 52px;max-width:1440px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
 
-/* ── Metric cards ─────────────────────────────────────────────────────────── */
-.metrics-row{
-  display:grid;
-  grid-template-columns:repeat(4,1fr);
-  gap:14px;
-}
-.metric-card{
-  background:var(--glass);
-  backdrop-filter:blur(20px);
-  -webkit-backdrop-filter:blur(20px);
-  border:1px solid var(--border);
-  border-radius:var(--r);
-  box-shadow:var(--shadow);
-  padding:22px 24px 20px;
-  position:relative;
-  overflow:hidden;
-  transition:transform .2s ease,box-shadow .2s ease;
-  cursor:default;
-}
-.metric-card:hover{
-  transform:translateY(-2px);
-  box-shadow:0 8px 32px rgba(0,0,0,0.6);
-}
-.metric-card::after{
-  content:'';
-  position:absolute;
-  top:0;left:0;right:0;
-  height:2px;
-  background:var(--blue);
-  border-radius:var(--r) var(--r) 0 0;
-}
-.metric-card.c-green::after{background:var(--green)}
-.metric-card.c-red::after{background:var(--red)}
-.metric-card.c-yellow::after{background:var(--yellow)}
+/* shared card */
+.card{background:var(--glass);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);padding:22px 24px}
+.card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.card-title{font-size:15px;font-weight:600;letter-spacing:-.2px}
+.card-badge{font-size:11px;color:var(--text3);background:rgba(255,255,255,.06);border:1px solid var(--border);border-radius:100px;padding:3px 9px}
 
-.metric-label{
-  font-size:10.5px;
-  font-weight:600;
-  letter-spacing:.09em;
-  text-transform:uppercase;
-  color:var(--text3);
-  margin-bottom:10px;
-}
-.metric-value{
-  font-size:38px;
-  font-weight:200;
-  letter-spacing:-1.5px;
-  color:var(--text);
-  line-height:1;
-  font-variant-numeric:tabular-nums;
-}
-.metric-card.c-green .metric-value{color:var(--green)}
-.metric-card.c-red .metric-value{color:var(--red)}
-.metric-sub{
-  font-size:11px;
-  color:var(--text3);
-  margin-top:7px;
-  letter-spacing:.01em;
-}
-
-/* ── Card shell ───────────────────────────────────────────────────────────── */
-.card{
-  background:var(--glass);
-  backdrop-filter:blur(20px);
-  -webkit-backdrop-filter:blur(20px);
-  border:1px solid var(--border);
-  border-radius:var(--r);
-  box-shadow:var(--shadow);
-  padding:24px;
-}
-.card-head{
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  margin-bottom:18px;
-}
-.card-title{
-  font-size:15px;
-  font-weight:600;
-  letter-spacing:-.2px;
-}
-.card-badge{
-  font-size:11px;
-  color:var(--text3);
-  background:rgba(255,255,255,0.06);
-  border:1px solid var(--border);
-  border-radius:100px;
-  padding:3px 9px;
-}
-
-/* ── Performance table ────────────────────────────────────────────────────── */
-.table-scroll{
-  overflow-x:auto;
-  margin:0 -24px;
-  padding:0 24px;
-}
-.perf-table{
-  width:100%;
-  border-collapse:collapse;
-  font-size:12.5px;
-  min-width:820px;
-}
-.perf-table thead th{
-  font-size:10.5px;
-  font-weight:600;
-  letter-spacing:.07em;
-  text-transform:uppercase;
-  color:var(--text3);
-  padding:6px 14px 10px;
-  text-align:left;
-  border-bottom:1px solid rgba(255,255,255,0.07);
-  white-space:nowrap;
-}
-.perf-table thead th:first-child{padding-left:20px}
-.perf-table tbody tr{
-  transition:background .12s ease;
-  cursor:default;
-  animation:rowIn .25s ease both;
-}
-@keyframes rowIn{
-  from{opacity:0;transform:translateY(5px)}
-  to{opacity:1;transform:translateY(0)}
-}
-.perf-table tbody tr:hover td{background:rgba(255,255,255,0.03)}
-.perf-table tbody td{
-  padding:9px 14px;
-  border-bottom:1px solid rgba(255,255,255,0.04);
-  vertical-align:middle;
-  white-space:nowrap;
-  color:var(--text);
-}
-.perf-table tbody td:first-child{padding-left:18px}
-.perf-table tbody tr.t-win td:first-child{box-shadow:inset 3px 0 0 var(--green)}
-.perf-table tbody tr.t-loss td:first-child{box-shadow:inset 3px 0 0 var(--red)}
-.perf-table tbody tr.t-pending td:first-child{box-shadow:inset 3px 0 0 var(--blue)}
-.perf-table tbody tr.t-win{background:rgba(48,209,88,.025)}
-.perf-table tbody tr.t-loss{background:rgba(255,69,58,.025)}
-.perf-table tbody tr.t-pending{background:rgba(10,132,255,.02)}
-
-.ticker-name{
-  font-size:13.5px;
-  font-weight:600;
-  letter-spacing:-.2px;
-}
-.mono{
-  font-variant-numeric:tabular-nums;
-  font-size:12px;
-}
-
-/* ── Badges ───────────────────────────────────────────────────────────────── */
-.b{
-  display:inline-flex;
-  align-items:center;
-  padding:2px 8px;
-  border-radius:100px;
-  font-size:10.5px;
-  font-weight:600;
-  letter-spacing:.04em;
-  white-space:nowrap;
-}
+/* badges */
+.b{display:inline-flex;align-items:center;padding:2px 8px;border-radius:100px;font-size:10.5px;font-weight:600;letter-spacing:.04em;white-space:nowrap}
 .b-buy{background:rgba(48,209,88,.14);color:var(--green)}
 .b-sell{background:rgba(255,69,58,.14);color:var(--red)}
 .b-hold{background:rgba(10,132,255,.14);color:var(--blue)}
@@ -755,150 +478,128 @@ body{
 .b-loss{background:rgba(255,69,58,.14);color:var(--red)}
 .b-pending{background:rgba(10,132,255,.14);color:var(--blue)}
 .b-warn{background:rgba(255,214,10,.14);color:var(--yellow)}
+.up{color:var(--green)}.dn{color:var(--red)}.neu{color:var(--text3)}
+.mono{font-variant-numeric:tabular-nums;font-size:12px}
 
-.up{color:var(--green)}
-.dn{color:var(--red)}
-.neu{color:var(--text3)}
+/* strong signal badge */
+.strong-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:100px;font-size:10px;font-weight:700;background:rgba(255,214,10,.15);color:var(--yellow);border:1px solid rgba(255,214,10,.3);letter-spacing:.04em;white-space:nowrap}
 
-/* ── Options P&L summary ──────────────────────────────────────────────────── */
-.pnl-grid{
-  display:grid;
-  grid-template-columns:repeat(4,1fr);
-  gap:14px;
-}
-.pnl-item{
-  background:rgba(255,255,255,0.03);
-  border:1px solid var(--border);
-  border-radius:var(--rs);
-  padding:18px 20px;
-  text-align:center;
-}
-.pnl-label{
-  font-size:10px;
-  font-weight:600;
-  letter-spacing:.09em;
-  text-transform:uppercase;
-  color:var(--text3);
-  margin-bottom:8px;
-}
-.pnl-value{
-  font-size:26px;
-  font-weight:300;
-  font-variant-numeric:tabular-nums;
-  letter-spacing:-0.5px;
-  line-height:1;
-}
-.pnl-sub{
-  font-size:10px;
-  color:var(--text3);
-  margin-top:5px;
-}
-@media(max-width:960px){.pnl-grid{grid-template-columns:repeat(2,1fr)}}
-@media(max-width:540px){.pnl-grid{grid-template-columns:1fr}}
+/* ── TODAY PAGE ────────────────────────────────────────────────────────────── */
 
-/* ── Options grid ─────────────────────────────────────────────────────────── */
-.options-grid{
-  display:grid;
-  grid-template-columns:1fr 1fr;
-  gap:14px;
-}
-.option-item{
-  background:rgba(255,255,255,0.03);
-  border:1px solid var(--border);
-  border-radius:var(--rs);
-  padding:14px 16px;
-  margin-bottom:10px;
-  transition:background .15s;
-}
-.option-item:last-child{margin-bottom:0}
-.option-item:hover{background:rgba(255,255,255,0.055)}
-.option-item-head{
-  display:flex;
-  align-items:center;
-  justify-content:space-between;
-  margin-bottom:9px;
-}
-.option-ticker{
-  font-size:15px;
-  font-weight:600;
-  letter-spacing:-.3px;
-}
-.option-meta{
-  display:flex;
-  flex-wrap:wrap;
-  gap:14px;
-}
+/* market banner */
+.market-banner{display:flex;align-items:center;gap:12px;background:rgba(255,214,10,.07);border:1px solid rgba(255,214,10,.2);border-radius:var(--rs);padding:12px 18px;font-size:13px;color:var(--yellow);font-weight:500}
+.market-banner-icon{font-size:16px;flex-shrink:0}
+.market-banner-text span{color:rgba(255,214,10,.6);font-weight:400}
+
+/* summary bar */
+.today-summary{display:flex;align-items:center;background:var(--glass);border:1px solid var(--border);border-radius:var(--r);padding:18px 24px;gap:0}
+.ts-stat{display:flex;align-items:center;gap:12px;flex:1;justify-content:center}
+.ts-num{font-size:36px;font-weight:200;letter-spacing:-1.2px;font-variant-numeric:tabular-nums;line-height:1}
+.ts-num.ts-buy{color:var(--green)}.ts-num.ts-sell{color:var(--red)}.ts-num.ts-hold{color:var(--blue)}
+.ts-label{font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--text3)}
+.ts-div{width:1px;height:36px;background:var(--border)}
+
+/* signal cards grid */
+.today-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:14px}
+
+.sig-card{background:var(--glass);border:1px solid var(--border);border-radius:var(--r);padding:18px 20px;position:relative;transition:transform .18s,box-shadow .18s;animation:rowIn .25s ease both}
+.sig-card:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(0,0,0,.55)}
+.sig-card.sc-buy{border-left:3px solid var(--green)}
+.sig-card.sc-sell{border-left:3px solid var(--red)}
+.sig-card.sc-hold{border-left:3px solid var(--blue)}
+
+.sig-card-head{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:12px;gap:8px}
+.sig-card-left{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+.sig-card-ticker{font-size:20px;font-weight:700;letter-spacing:-.5px}
+.sig-card-when{font-size:11px;color:var(--text3);white-space:nowrap;padding-top:2px}
+
+.sig-card-opt{background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.07);border-radius:var(--rs);padding:10px 12px;margin-bottom:10px}
+.sig-card-opt-title{font-size:12px;font-weight:600;letter-spacing:-.1px;margin-bottom:8px;color:var(--text2)}
+.sig-card-metas{display:flex;flex-wrap:wrap;gap:12px}
 .ometa{font-size:11px}
-.ometa-l{
-  display:block;
-  font-size:9.5px;
-  font-weight:600;
-  letter-spacing:.07em;
-  text-transform:uppercase;
-  color:var(--text3);
-  margin-bottom:1px;
-}
-.ometa-v{
-  color:var(--text2);
-  font-variant-numeric:tabular-nums;
-}
-.iv-item{
-  background:rgba(255,69,58,0.07);
-  border:1px solid rgba(255,69,58,0.18);
-  border-radius:var(--rs);
-  padding:14px 16px;
-  margin-bottom:10px;
-}
-.iv-item.iv-warn{
-  background:rgba(255,214,10,0.07);
-  border-color:rgba(255,214,10,0.18);
-}
-.iv-item:last-child{margin-bottom:0}
+.ometa-l{display:block;font-size:9.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--text3);margin-bottom:1px}
+.ometa-v{color:var(--text2);font-variant-numeric:tabular-nums}
 
-/* ── Signal feed ──────────────────────────────────────────────────────────── */
-.signal-wrap{
-  display:flex;
-  flex-wrap:wrap;
-  gap:8px;
-  min-height:44px;
-  align-content:flex-start;
-}
-.sig-pill{
-  display:inline-flex;
-  align-items:center;
-  gap:5px;
-  padding:5px 12px;
-  border-radius:100px;
-  font-size:12px;
-  font-weight:500;
-  animation:rowIn .25s ease both;
-  white-space:nowrap;
-}
-.sig-pill.sp-buy{background:rgba(48,209,88,.1);border:1px solid rgba(48,209,88,.2);color:var(--green)}
-.sig-pill.sp-sell{background:rgba(255,69,58,.1);border:1px solid rgba(255,69,58,.2);color:var(--red)}
-.sig-pill.sp-hold{background:rgba(10,132,255,.1);border:1px solid rgba(10,132,255,.2);color:var(--blue)}
-.sig-time{color:rgba(255,255,255,0.35);font-size:10.5px;font-variant-numeric:tabular-nums}
-.sig-ticker{font-weight:700}
+.sig-card-prices{display:flex;align-items:center;gap:12px;font-size:12px;color:var(--text3);margin-bottom:10px}
+.sig-card-prices span{color:var(--text2);font-variant-numeric:tabular-nums}
 
-/* ── Empty states ─────────────────────────────────────────────────────────── */
-.empty{color:var(--text3);font-size:13px;padding:28px 0;text-align:center}
+.sig-card-outcomes{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.sco-item{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--text3)}
+.sco-label{font-size:10px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+
+/* empty / loading states */
+.empty{color:var(--text3);font-size:13px;padding:32px 0;text-align:center}
 .empty-cell{color:var(--text3);font-size:13px;padding:40px 24px !important;text-align:center}
+@keyframes rowIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 
-/* ── Responsive ───────────────────────────────────────────────────────────── */
+/* ── HISTORY PAGE ──────────────────────────────────────────────────────────── */
+
+/* history summary metric row */
+.metrics-row{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+.metric-card{background:var(--glass);border:1px solid var(--border);border-radius:var(--r);box-shadow:var(--shadow);padding:20px 22px 18px;position:relative;overflow:hidden;transition:transform .2s,box-shadow .2s;cursor:default}
+.metric-card:hover{transform:translateY(-2px);box-shadow:0 8px 32px rgba(0,0,0,.6)}
+.metric-card::after{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:var(--blue);border-radius:var(--r) var(--r) 0 0}
+.metric-card.c-green::after{background:var(--green)}.metric-card.c-red::after{background:var(--red)}.metric-card.c-yellow::after{background:var(--yellow)}
+.metric-label{font-size:10.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--text3);margin-bottom:8px}
+.metric-value{font-size:34px;font-weight:200;letter-spacing:-1.4px;color:var(--text);line-height:1;font-variant-numeric:tabular-nums}
+.metric-card.c-green .metric-value{color:var(--green)}.metric-card.c-red .metric-value{color:var(--red)}
+.metric-sub{font-size:11px;color:var(--text3);margin-top:6px;letter-spacing:.01em}
+
+/* filter row */
+.filter-row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.filter-btn{padding:6px 16px;border-radius:8px;font-size:12px;font-weight:500;color:var(--text2);cursor:pointer;border:1px solid var(--border);background:var(--glass);transition:all .15s;white-space:nowrap}
+.filter-btn.active{background:var(--blue);color:#fff;border-color:var(--blue)}
+.filter-btn:hover:not(.active){background:rgba(255,255,255,.08);color:var(--text)}
+.filter-count{font-size:11px;color:var(--text3);margin-left:auto}
+
+/* date groups */
+.date-group{border:1px solid var(--border);border-radius:var(--rs);overflow:hidden;background:var(--glass)}
+.dg-header{display:flex;align-items:center;justify-content:space-between;padding:13px 18px;background:rgba(255,255,255,.035);cursor:pointer;user-select:none;transition:background .15s;gap:12px}
+.dg-header:hover{background:rgba(255,255,255,.065)}
+.dg-header-left{display:flex;align-items:center;gap:12px}
+.dg-date{font-size:13px;font-weight:600;letter-spacing:-.2px}
+.dg-count{font-size:11px;color:var(--text3)}
+.dg-outcomes{display:flex;gap:8px}
+.dg-oc{font-size:10.5px;padding:1px 7px;border-radius:100px;font-weight:600}
+.dg-oc.win{background:rgba(48,209,88,.12);color:var(--green)}
+.dg-oc.loss{background:rgba(255,69,58,.12);color:var(--red)}
+.dg-oc.pending{background:rgba(10,132,255,.12);color:var(--blue)}
+.dg-arrow{color:var(--text3);font-size:10px;transition:transform .2s;flex-shrink:0}
+.dg-header.collapsed .dg-arrow{transform:rotate(-90deg)}
+.dg-body{overflow:hidden}
+
+/* performance table */
+.table-scroll{overflow-x:auto;margin:0 -2px;padding:0 2px}
+.perf-table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:760px}
+.perf-table thead th{font-size:10.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;color:var(--text3);padding:8px 14px 10px;text-align:left;border-bottom:1px solid rgba(255,255,255,.07);white-space:nowrap}
+.perf-table thead th:first-child{padding-left:20px}
+.perf-table tbody tr{transition:background .12s;cursor:default;animation:rowIn .25s ease both}
+.perf-table tbody tr:hover td{background:rgba(255,255,255,.03)}
+.perf-table tbody td{padding:9px 14px;border-bottom:1px solid rgba(255,255,255,.04);vertical-align:middle;white-space:nowrap;color:var(--text)}
+.perf-table tbody td:first-child{padding-left:18px}
+.perf-table tbody tr.t-win td:first-child{box-shadow:inset 3px 0 0 var(--green)}
+.perf-table tbody tr.t-loss td:first-child{box-shadow:inset 3px 0 0 var(--red)}
+.perf-table tbody tr.t-pending td:first-child{box-shadow:inset 3px 0 0 var(--blue)}
+.perf-table tbody tr.t-win{background:rgba(48,209,88,.025)}
+.perf-table tbody tr.t-loss{background:rgba(255,69,58,.025)}
+.perf-table tbody tr.t-pending{background:rgba(10,132,255,.02)}
+.ticker-name{font-size:13.5px;font-weight:600;letter-spacing:-.2px}
+
+/* ── Responsive ──────────────────────────────────────────────────────────── */
 @media(max-width:960px){
   .metrics-row{grid-template-columns:repeat(2,1fr)}
-  .options-grid{grid-template-columns:1fr}
+  .today-grid{grid-template-columns:1fr}
 }
 @media(max-width:540px){
   .metrics-row{grid-template-columns:1fr}
-  .main{padding:90px 16px 40px}
-  .nav{padding:0 16px}
+  .main{padding:148px 14px 40px}
+  .nav,.tab-bar{padding:0 14px}
+  .tab-btn{padding:6px 14px;font-size:12px}
 }
 </style>
 </head>
 <body>
 
-<!-- Progress bar -->
 <div class="progress-track"><div class="progress-fill" id="pgFill"></div></div>
 
 <!-- Nav -->
@@ -923,179 +624,130 @@ body{
   </div>
 </nav>
 
-<!-- Live ticker bar -->
+<!-- Tab bar -->
+<div class="tab-bar">
+  <button class="tab-btn active" id="tabToday" onclick="switchTab('today')">Today's Signals</button>
+  <button class="tab-btn" id="tabHist"  onclick="switchTab('history')">Performance History</button>
+</div>
+
+<!-- Ticker bar -->
 <div class="ticker-bar">
   <div class="ticker-track" id="tickerTrack">
     <span class="ti-item"><span class="ti-ticker" style="color:var(--text3);font-weight:400">Fetching prices…</span></span>
   </div>
 </div>
 
-<!-- Main -->
-<main class="main">
+<!-- ── PAGE 1: TODAY'S SIGNALS ─────────────────────────────────────────────── -->
+<main class="main" id="todayPage">
 
-  <!-- Metric cards row 1: signal performance -->
-  <div class="metrics-row">
-    <div class="metric-card c-blue" id="mc0">
-      <div class="metric-label">Total Signals</div>
-      <div class="metric-value" id="mv0">—</div>
-      <div class="metric-sub">tracked entries</div>
+  <!-- market banner -->
+  <div class="market-banner" id="marketBanner" style="display:none">
+    <span class="market-banner-icon">🔴</span>
+    <div class="market-banner-text" id="marketBannerText">Market Closed</div>
+  </div>
+
+  <!-- summary bar -->
+  <div class="today-summary">
+    <div class="ts-stat">
+      <span class="ts-num ts-buy" id="tsBuy">0</span>
+      <span class="ts-label">BUY</span>
     </div>
-    <div class="metric-card c-blue" id="mc1">
-      <div class="metric-label">6h Win Rate</div>
-      <div class="metric-value" id="mv1">—</div>
-      <div class="metric-sub" id="ms1">resolved signals</div>
+    <div class="ts-div"></div>
+    <div class="ts-stat">
+      <span class="ts-num ts-sell" id="tsSell">0</span>
+      <span class="ts-label">SELL</span>
     </div>
-    <div class="metric-card c-blue" id="mc2">
-      <div class="metric-label">24h Win Rate</div>
-      <div class="metric-value" id="mv2">—</div>
-      <div class="metric-sub" id="ms2">resolved signals</div>
-    </div>
-    <div class="metric-card c-blue" id="mc3">
-      <div class="metric-label">Best Call</div>
-      <div class="metric-value" id="mv3">—</div>
-      <div class="metric-sub" id="ms3">top performer</div>
+    <div class="ts-div"></div>
+    <div class="ts-stat">
+      <span class="ts-num ts-hold" id="tsHold">0</span>
+      <span class="ts-label">HOLD</span>
     </div>
   </div>
 
-  <!-- Metric cards row 2: option performance -->
-  <div class="metrics-row">
-    <div class="metric-card c-blue" id="mc4">
-      <div class="metric-label">Best Option Return</div>
-      <div class="metric-value" id="mv4">—</div>
-      <div class="metric-sub" id="ms4">top contract</div>
-    </div>
-    <div class="metric-card c-blue" id="mc5">
-      <div class="metric-label">Avg Option Return</div>
-      <div class="metric-value" id="mv5">—</div>
-      <div class="metric-sub" id="ms5">resolved contracts</div>
-    </div>
-    <div class="metric-card c-blue" id="mc6">
-      <div class="metric-label">Option Win Rate</div>
-      <div class="metric-value" id="mv6">—</div>
-      <div class="metric-sub" id="ms6">profitable contracts</div>
-    </div>
-    <div class="metric-card c-blue" id="mc7">
-      <div class="metric-label">Combined P&amp;L</div>
-      <div class="metric-value" id="mv7">—</div>
-      <div class="metric-sub" id="ms7">1 contract each</div>
-    </div>
-  </div>
-
-  <!-- Performance table -->
-  <div class="card">
-    <div class="card-head">
-      <span class="card-title">Performance</span>
-      <span class="card-badge" id="perfBadge">Loading…</span>
-    </div>
-    <div class="table-scroll">
-      <table class="perf-table">
-        <thead>
-          <tr>
-            <th>Ticker</th>
-            <th>Direction</th>
-            <th>Entry</th>
-            <th>Live</th>
-            <th>Chg</th>
-            <th>6h</th>
-            <th>24h</th>
-            <th>7d</th>
-            <th>Option</th>
-            <th>IV</th>
-            <th>Opt Return</th>
-            <th>Outcome</th>
-          </tr>
-        </thead>
-        <tbody id="perfBody">
-          <tr><td colspan="12" class="empty-cell">Loading performance data…</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </div>
-
-  <!-- Options panels -->
-  <div class="options-grid">
-    <div class="card">
-      <div class="card-head">
-        <span class="card-title">Active Recommendations</span>
-        <span class="card-badge" id="recsBadge">—</span>
-      </div>
-      <div id="optRecs"><p class="empty">Loading…</p></div>
-    </div>
-    <div class="card">
-      <div class="card-head">
-        <span class="card-title">IV Warnings</span>
-        <span class="card-badge" style="color:var(--yellow)">High volatility</span>
-      </div>
-      <div id="ivWarn"><p class="empty">Loading…</p></div>
-    </div>
-  </div>
-
-  <!-- Signal feed -->
-  <div class="card">
-    <div class="card-head">
-      <span class="card-title">Signal Feed</span>
-      <span class="card-badge" id="sigBadge">Recent</span>
-    </div>
-    <div class="signal-wrap" id="sigFeed">
-      <p class="empty">Loading signals…</p>
-    </div>
-  </div>
-
-  <!-- Options P&L Summary -->
-  <div class="card">
-    <div class="card-head">
-      <span class="card-title">Options P&amp;L Summary</span>
-      <span class="card-badge">1 contract per signal</span>
-    </div>
-    <div class="pnl-grid" id="pnlGrid">
-      <div class="pnl-item">
-        <div class="pnl-label">BUY Signals P&amp;L</div>
-        <div class="pnl-value" id="pnlBuy">—</div>
-        <div class="pnl-sub" id="pnlBuySub">no data</div>
-      </div>
-      <div class="pnl-item">
-        <div class="pnl-label">SELL Signals P&amp;L</div>
-        <div class="pnl-value" id="pnlSell">—</div>
-        <div class="pnl-sub" id="pnlSellSub">no data</div>
-      </div>
-      <div class="pnl-item">
-        <div class="pnl-label">Combined P&amp;L</div>
-        <div class="pnl-value" id="pnlCombined">—</div>
-        <div class="pnl-sub" id="pnlCombinedSub">all signals</div>
-      </div>
-      <div class="pnl-item">
-        <div class="pnl-label">Options Win Rate</div>
-        <div class="pnl-value" id="pnlWinRate">—</div>
-        <div class="pnl-sub" id="pnlWinRateSub">resolved contracts</div>
-      </div>
-    </div>
+  <!-- signal cards -->
+  <div class="today-grid" id="todayGrid">
+    <p class="empty">Loading signals…</p>
   </div>
 
 </main>
 
+<!-- ── PAGE 2: PERFORMANCE HISTORY ────────────────────────────────────────── -->
+<main class="main" id="histPage" style="display:none">
+
+  <!-- aggregate stats -->
+  <div class="metrics-row" id="histStats">
+    <div class="metric-card" id="hmc0">
+      <div class="metric-label">Overall Win Rate</div>
+      <div class="metric-value" id="hmv0">—</div>
+      <div class="metric-sub" id="hms0">resolved signals</div>
+    </div>
+    <div class="metric-card" id="hmc1">
+      <div class="metric-label">Best Trade</div>
+      <div class="metric-value" id="hmv1">—</div>
+      <div class="metric-sub" id="hms1">top performer</div>
+    </div>
+    <div class="metric-card" id="hmc2">
+      <div class="metric-label">Worst Trade</div>
+      <div class="metric-value" id="hmv2">—</div>
+      <div class="metric-sub" id="hms2">bottom performer</div>
+    </div>
+    <div class="metric-card" id="hmc3">
+      <div class="metric-label">Total Hypo P&amp;L</div>
+      <div class="metric-value" id="hmv3">—</div>
+      <div class="metric-sub" id="hms3">1 contract each</div>
+    </div>
+  </div>
+
+  <!-- filter row -->
+  <div class="card" style="padding:16px 22px">
+    <div class="filter-row">
+      <button class="filter-btn active" data-filter="ALL"     onclick="setFilter('ALL')">All</button>
+      <button class="filter-btn"        data-filter="BUY"     onclick="setFilter('BUY')">BUY</button>
+      <button class="filter-btn"        data-filter="SELL"    onclick="setFilter('SELL')">SELL</button>
+      <button class="filter-btn"        data-filter="WIN"     onclick="setFilter('WIN')">WIN</button>
+      <button class="filter-btn"        data-filter="LOSS"    onclick="setFilter('LOSS')">LOSS</button>
+      <button class="filter-btn"        data-filter="PENDING" onclick="setFilter('PENDING')">PENDING</button>
+      <span class="filter-count" id="filterCount"></span>
+    </div>
+  </div>
+
+  <!-- date groups -->
+  <div id="histGroups"><p class="empty">Loading history…</p></div>
+
+</main>
+
 <script>
-const PIPELINE_INTERVAL = 960000; // 16 minutes
-const PRICE_INTERVAL    = 30000;  // 30 seconds
+const PIPELINE_INTERVAL = 960000;
+const PRICE_INTERVAL    = 30000;
+
+let currentTab  = 'today';
+let historyData = [];
+let histFilter  = 'ALL';
+let histLoaded  = false;
+let openGroups  = new Set();
+
+// ── Utilities ────────────────────────────────────────────────────────────────
 
 async function get(url) {
   try { const r = await fetch(url); return r.ok ? r.json() : null; }
   catch { return null; }
 }
 
-function fmt$(v) {
-  return v == null ? '<span class="neu">—</span>' : '$' + Number(v).toFixed(2);
-}
+function fmt$(v) { return v == null ? '<span class="neu">—</span>' : '$' + Number(v).toFixed(2); }
+
 function fmtPct(v) {
   if (v == null) return '<span class="neu">—</span>';
   const cls = v > 0 ? 'up' : v < 0 ? 'dn' : 'neu';
   return `<span class="${cls}">${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%</span>`;
 }
+
 function fmtIV(v) {
   if (v == null) return '<span class="neu">—</span>';
   const pct = v * 100;
   const cls = pct > 80 ? 'dn' : pct > 50 ? '' : 'up';
   return `<span class="${cls}">${pct.toFixed(0)}%</span>`;
 }
+
 function shortTime(ts) {
   if (!ts) return '—';
   try {
@@ -1103,438 +755,434 @@ function shortTime(ts) {
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   } catch { return ts.slice(11, 16) || '—'; }
 }
+
 function timeAgo(ts) {
   if (!ts) return '—';
   try {
     const d = new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
     const s = Math.floor((Date.now() - d) / 1000);
-    if (s < 60) return s + 's ago';
-    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 60)    return s + 's ago';
+    if (s < 3600)  return Math.floor(s / 60) + 'm ago';
     if (s < 86400) return Math.floor(s / 3600) + 'h ago';
     return Math.floor(s / 86400) + 'd ago';
   } catch { return '—'; }
 }
 
+function fmtGroupDate(dateStr) {
+  try {
+    const d = new Date(dateStr + 'T12:00:00Z');
+    return d.toLocaleDateString('en-US', { month: 'long', day: '2-digit', year: 'numeric', timeZone: 'UTC' });
+  } catch { return dateStr; }
+}
+
+// ── Tab switching ─────────────────────────────────────────────────────────────
+
+function switchTab(tab) {
+  currentTab = tab;
+  document.getElementById('todayPage').style.display = tab === 'today' ? '' : 'none';
+  document.getElementById('histPage').style.display  = tab === 'history' ? '' : 'none';
+  document.getElementById('tabToday').classList.toggle('active', tab === 'today');
+  document.getElementById('tabHist').classList.toggle('active', tab === 'history');
+  if (tab === 'history' && !histLoaded) {
+    histLoaded = true;
+    refreshHistory();
+  }
+}
+
+// ── Nav / status ──────────────────────────────────────────────────────────────
+
 async function refreshStats() {
   const d = await get('/api/stats');
   if (!d) {
     const pill = document.getElementById('statusPill');
-    pill.classList.remove('idle');
-    pill.classList.add('offline');
+    pill.className = 'status-pill offline';
     document.getElementById('statusLabel').textContent = 'Offline';
-    ['mv0','mv1','mv2','mv3','mv4','mv5','mv6','mv7'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) { el.textContent = '—'; el.style.color = 'var(--text3)'; }
-    });
     return;
   }
-
   const pill = document.getElementById('statusPill');
   const lbl  = document.getElementById('statusLabel');
-  pill.classList.remove('offline', 'idle');
-  if (d.bot_state === 'live') {
-    lbl.textContent = 'Live';
-  } else if (d.bot_state === 'idle') {
-    pill.classList.add('idle');
-    lbl.textContent = 'Idle';
-  } else {
-    pill.classList.add('offline');
-    lbl.textContent = 'Offline';
-  }
+  pill.className = 'status-pill' + (d.bot_state === 'idle' ? ' idle' : d.bot_state !== 'live' ? ' offline' : '');
+  lbl.textContent = d.bot_state === 'live' ? 'Live' : d.bot_state === 'idle' ? 'Idle' : 'Offline';
 
   if (d.minutes_since_heartbeat != null) {
     const m = d.minutes_since_heartbeat;
-    document.getElementById('navLastRun').textContent =
-      'Last run: ' + (m < 1 ? 'just now' : Math.round(m) + 'm ago');
+    document.getElementById('navLastRun').textContent = 'Last run: ' + (m < 1 ? 'just now' : Math.round(m) + 'm ago');
   }
   if (d.minutes_until_next_run != null) {
     const n = d.minutes_until_next_run;
-    document.getElementById('navNextRun').textContent =
-      'Next: ' + (n < 1 ? '<1m' : Math.round(n) + 'm');
+    document.getElementById('navNextRun').textContent = 'Next: ' + (n < 1 ? '<1m' : Math.round(n) + 'm');
   }
-  if (d.last_posts_collected != null || d.last_signals_generated != null) {
-    document.getElementById('navRunStats').textContent =
-      (d.last_posts_collected ?? '—') + ' posts · ' + (d.last_signals_generated ?? '—') + ' signals';
-  }
-
+  if (d.last_posts_collected != null || d.last_signals_generated != null)
+    document.getElementById('navRunStats').textContent = (d.last_posts_collected ?? '—') + ' posts · ' + (d.last_signals_generated ?? '—') + ' signals';
   document.getElementById('navTime').textContent = d.last_updated || '—';
-
-  document.getElementById('mv0').textContent = d.total_signals ?? '—';
-
-  const wr6 = d.win_rate_6h;
-  const mc1 = document.getElementById('mc1');
-  const mv1 = document.getElementById('mv1');
-  if (wr6 != null) {
-    mv1.textContent = wr6 + '%';
-    mc1.className = 'metric-card ' + (wr6 >= 50 ? 'c-green' : 'c-red');
-  } else {
-    mv1.textContent = 'N/A';
-    mc1.className = 'metric-card c-blue';
-  }
-
-  const wr24 = d.win_rate_24h;
-  const mc2  = document.getElementById('mc2');
-  const mv2  = document.getElementById('mv2');
-  if (wr24 != null) {
-    mv2.textContent = wr24 + '%';
-    mc2.className = 'metric-card ' + (wr24 >= 50 ? 'c-green' : 'c-red');
-  } else {
-    mv2.textContent = 'N/A';
-    mc2.className = 'metric-card c-blue';
-  }
-
-  const mc3 = document.getElementById('mc3');
-  const mv3 = document.getElementById('mv3');
-  const ms3 = document.getElementById('ms3');
-  if (d.best_call) {
-    const sign = d.best_call.pct > 0 ? '+' : '';
-    mv3.textContent = d.best_call.ticker;
-    ms3.textContent = sign + d.best_call.pct + '%  ' + d.best_call.signal;
-    mc3.className = 'metric-card c-green';
-  } else {
-    mv3.textContent = 'N/A';
-    ms3.textContent = 'no resolved signals';
-    mc3.className = 'metric-card c-blue';
-  }
-
-  // ── Option metric cards ──────────────────────────────────────────────────────
-  const mc4 = document.getElementById('mc4');
-  const mv4 = document.getElementById('mv4');
-  const ms4 = document.getElementById('ms4');
-  if (d.best_option_return) {
-    const sign = d.best_option_return.pct > 0 ? '+' : '';
-    mv4.textContent = d.best_option_return.ticker;
-    ms4.textContent = sign + d.best_option_return.pct + '%  ' + d.best_option_return.signal;
-    mc4.className = 'metric-card ' + (d.best_option_return.pct > 0 ? 'c-green' : 'c-red');
-  } else {
-    mv4.textContent = 'N/A';
-    ms4.textContent = 'no resolved contracts';
-    mc4.className = 'metric-card c-blue';
-  }
-
-  const mc5 = document.getElementById('mc5');
-  const mv5 = document.getElementById('mv5');
-  const ms5 = document.getElementById('ms5');
-  if (d.avg_option_return != null) {
-    const sign = d.avg_option_return > 0 ? '+' : '';
-    mv5.textContent = sign + d.avg_option_return + '%';
-    ms5.textContent = (d.resolved_options_count || 0) + ' contracts';
-    mc5.className = 'metric-card ' + (d.avg_option_return >= 0 ? 'c-green' : 'c-red');
-  } else {
-    mv5.textContent = 'N/A';
-    ms5.textContent = 'no resolved contracts';
-    mc5.className = 'metric-card c-blue';
-  }
-
-  const mc6 = document.getElementById('mc6');
-  const mv6 = document.getElementById('mv6');
-  const ms6 = document.getElementById('ms6');
-  if (d.option_win_rate != null) {
-    mv6.textContent = d.option_win_rate + '%';
-    ms6.textContent = 'options only';
-    mc6.className = 'metric-card ' + (d.option_win_rate >= 50 ? 'c-green' : 'c-red');
-  } else {
-    mv6.textContent = 'N/A';
-    ms6.textContent = 'no resolved contracts';
-    mc6.className = 'metric-card c-blue';
-  }
-
-  const mc7 = document.getElementById('mc7');
-  const mv7 = document.getElementById('mv7');
-  const ms7 = document.getElementById('ms7');
-  if (d.total_combined_pnl != null && d.resolved_options_count > 0) {
-    const pnl = d.total_combined_pnl;
-    mv7.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(0);
-    ms7.textContent = '1 contract each';
-    mc7.className = 'metric-card ' + (pnl >= 0 ? 'c-green' : 'c-red');
-  } else {
-    mv7.textContent = 'N/A';
-    ms7.textContent = '1 contract each';
-    mc7.className = 'metric-card c-blue';
-  }
-
-  // ── Options P&L summary panel ────────────────────────────────────────────────
-  function fmtPnlValue(val, el, subEl, subText) {
-    if (val == null || val === 0 && !subText.includes('0')) {
-      el.textContent = '$0';
-      el.className = 'pnl-value neu';
-    } else {
-      el.textContent = (val >= 0 ? '+$' : '-$') + Math.abs(val).toFixed(0);
-      el.className = 'pnl-value ' + (val >= 0 ? 'up' : 'dn');
-    }
-    if (subEl && subText) subEl.textContent = subText;
-  }
-
-  fmtPnlValue(
-    d.total_buy_pnl,
-    document.getElementById('pnlBuy'),
-    document.getElementById('pnlBuySub'),
-    'if bought 1 contract each BUY'
-  );
-  fmtPnlValue(
-    d.total_sell_pnl,
-    document.getElementById('pnlSell'),
-    document.getElementById('pnlSellSub'),
-    'if bought 1 contract each SELL'
-  );
-  fmtPnlValue(
-    d.total_combined_pnl,
-    document.getElementById('pnlCombined'),
-    document.getElementById('pnlCombinedSub'),
-    'all signals combined'
-  );
-
-  const wrEl  = document.getElementById('pnlWinRate');
-  const wrSub = document.getElementById('pnlWinRateSub');
-  if (d.option_win_rate != null) {
-    wrEl.textContent = d.option_win_rate + '%';
-    wrEl.className   = 'pnl-value ' + (d.option_win_rate >= 50 ? 'up' : 'dn');
-    wrSub.textContent = (d.resolved_options_count || 0) + ' resolved';
-  } else {
-    wrEl.textContent = '—';
-    wrEl.className   = 'pnl-value neu';
-    wrSub.textContent = 'no data yet';
-  }
 }
 
-async function refreshPerf() {
-  const rows = await get('/api/performance');
-  if (!rows) {
-    document.getElementById('perfBadge').textContent = 'Error';
-    document.getElementById('perfBody').innerHTML =
-      '<tr><td colspan="12" class="empty-cell" style="color:var(--red)">Could not load performance data — server may be offline.</td></tr>';
+// ── Today's Signals ───────────────────────────────────────────────────────────
+
+async function refreshToday() {
+  const data = await get('/api/today');
+  if (!data) {
+    document.getElementById('todayGrid').innerHTML = '<p class="empty" style="color:var(--red)">Could not load — server may be offline.</p>';
     return;
   }
 
-  document.getElementById('perfBadge').textContent = rows.length + ' record' + (rows.length !== 1 ? 's' : '');
+  const { signals, market_open, next_open } = data;
 
-  const tbody = document.getElementById('perfBody');
-  if (!rows.length) {
-    tbody.innerHTML = '<tr><td colspan="12" class="empty-cell">No performance data yet — run the bot to generate signals.</td></tr>';
+  // market banner
+  const banner = document.getElementById('marketBanner');
+  if (!market_open) {
+    banner.style.display = 'flex';
+    const next = next_open ? ' · Next open ' + next_open : '';
+    document.getElementById('marketBannerText').innerHTML = 'Market Closed<span>' + next + '</span>';
+  } else {
+    banner.style.display = 'none';
+  }
+
+  // summary counts
+  const buys  = signals.filter(s => s.signal === 'BUY').length;
+  const sells = signals.filter(s => s.signal === 'SELL').length;
+  const holds = signals.filter(s => s.signal === 'HOLD').length;
+  document.getElementById('tsBuy').textContent  = buys;
+  document.getElementById('tsSell').textContent = sells;
+  document.getElementById('tsHold').textContent = holds;
+
+  const grid = document.getElementById('todayGrid');
+  if (!signals.length) {
+    grid.innerHTML = '<p class="empty">No signals in the last 24 hours. The bot analyzes new signals every ~15 minutes.</p>';
     return;
   }
 
-  tbody.innerHTML = rows.map((r, i) => {
-    // Stock outcome
-    const stockOut24 = r.outcome     || 'PENDING';
-    const stockOut6  = r.outcome_6h  || 'PENDING';
-    const stockEff   = stockOut24 !== 'PENDING' ? stockOut24 : stockOut6;
-
-    // Best available option return: prefer 7d > 24h > 6h
-    const optRet  = r.option_return_7d  ?? r.option_return_24h  ?? r.option_return_6h;
-    const optVal  = r.option_value_7d   ?? r.option_value_24h   ?? r.option_value_6h;
-    const optCost = r.option_cost;
-    const optSrc  = r.option_price_source;
-
-    // Option outcome is based on option return, not stock move
-    const optEff = optRet == null ? 'PENDING' : optRet > 0 ? 'WIN' : 'LOSS';
-
-    // Row coloring uses option outcome when options exist, else stock outcome
-    const eff    = r.option_contract ? optEff : stockEff;
-    const trCls  = eff === 'WIN' ? 't-win' : eff === 'LOSS' ? 't-loss' : 't-pending';
-
+  grid.innerHTML = signals.map((r, i) => {
+    const sigCls = r.signal === 'BUY' ? 'sc-buy' : r.signal === 'SELL' ? 'sc-sell' : 'sc-hold';
     const dirBadge = r.signal === 'BUY'
       ? '<span class="b b-buy">BUY</span>'
       : r.signal === 'SELL'
       ? '<span class="b b-sell">SELL</span>'
       : '<span class="b b-hold">HOLD</span>';
-
-    const outBadge = eff === 'WIN'
-      ? '<span class="b b-win">WIN</span>'
-      : eff === 'LOSS'
-      ? '<span class="b b-loss">LOSS</span>'
-      : '<span class="b b-pending">PENDING</span>';
-
-    // Separate stock outcome label shown below the main badge
-    const stockBadge = r.option_contract
-      ? `<small class="neu" style="display:block;margin-top:2px;font-size:10px;opacity:.7">Stock: ${stockEff}</small>`
+    const strongBadge = (r.confidence != null && r.confidence >= 0.80)
+      ? '<span class="strong-badge">★ Strong Signal</span>'
       : '';
-
-    const opt = r.option_contract
-      ? `<span title="${r.option_contract}">${r.option_type || '?'}&nbsp;$${r.option_strike || '?'}</span>`
-      : '<span class="neu">—</span>';
-
-    let optRetHtml = '<span class="neu">—</span>';
-    if (optRet != null && optCost != null) {
-      const profit = optVal != null ? optVal - optCost : null;
-      const cls  = optRet >= 0 ? 'up' : 'dn';
-      const sign = optRet >= 0 ? '+' : '';
-      let str = `<span class="${cls}" style="white-space:nowrap">${sign}${optRet.toFixed(1)}%`;
-      if (profit != null) {
-        str += `<br><small>${profit >= 0 ? '+' : ''}$${Math.abs(profit).toFixed(0)}</small>`;
-      }
-      if (optSrc) {
-        const srcMap = {live:'Live',intrinsic:'At Expiry',estimate:'Est.',expired:'Expired'};
-        const srcLabel = srcMap[optSrc] || optSrc;
-        const srcCls = optSrc === 'live' ? 'up' : optSrc === 'expired' ? 'dn' : 'neu';
-        str += `<br><small class="${srcCls}" style="font-size:9px;letter-spacing:.04em;opacity:.75">${srcLabel}</small>`;
-      }
-      str += '</span>';
-      optRetHtml = str;
-    }
-
-    // Tooltip
-    const stockPct   = r.percent_change_6h ?? r.percent_change_24h ?? r.percent_change_7d;
-    const ttStockPct = stockPct != null ? (stockPct >= 0 ? '+' : '') + stockPct.toFixed(2) + '%' : 'N/A';
-    const ttOptCost  = optCost  != null ? '$' + optCost.toFixed(2)  : 'N/A';
-    const ttOptVal   = optVal   != null ? '$' + optVal.toFixed(2)   : 'N/A';
-    const ttOptRet   = optRet   != null ? (optRet >= 0 ? '+' : '') + optRet.toFixed(1) + '%' : 'N/A';
-    const profit     = (optVal != null && optCost != null) ? optVal - optCost : null;
-    const ttProfit   = profit   != null ? (profit >= 0 ? '+$' : '-$') + Math.abs(profit).toFixed(2) : 'N/A';
-    const ttLines    = r.option_contract
-      ? ['Stock move: ' + ttStockPct, 'Option entry cost: ' + ttOptCost, 'Option current value: ' + ttOptVal, 'Option return: ' + ttOptRet, 'Option P&L: ' + ttProfit].join('\\n')
-      : 'Stock move: ' + ttStockPct;
-
+    const when = timeAgo(r.signal_timestamp);
     const tk = (r.ticker || '').replace(/[^A-Z0-9.]/g, '');
 
-    return `<tr class="${trCls}" title="${ttLines.replace(/"/g, '&quot;')}" style="animation-delay:${Math.min(i * 15, 300)}ms">
-      <td><span class="ticker-name">${r.ticker}</span></td>
-      <td>${dirBadge}</td>
-      <td class="mono">${fmt$(r.price_at_signal)}</td>
-      <td class="mono price-cell" data-ticker="${tk}"><span class="neu">—</span></td>
-      <td class="mono chg-cell"   data-ticker="${tk}"><span class="neu">—</span></td>
-      <td class="mono">${fmtPct(r.percent_change_6h)}</td>
-      <td class="mono">${fmtPct(r.percent_change_24h)}</td>
-      <td class="mono">${fmtPct(r.percent_change_7d)}</td>
-      <td class="mono">${opt}</td>
-      <td class="mono">${fmtIV(r.option_iv)}</td>
-      <td class="mono">${optRetHtml}</td>
-      <td>${outBadge}${stockBadge}</td>
-    </tr>`;
-  }).join('');
-}
-
-async function refreshOptions() {
-  const data = await get('/api/options');
-  if (!data) {
-    document.getElementById('optRecs').innerHTML = '<p class="empty" style="color:var(--red)">Could not load — server may be offline</p>';
-    document.getElementById('ivWarn').innerHTML  = '<p class="empty" style="color:var(--red)">Could not load — server may be offline</p>';
-    return;
-  }
-
-  const recs  = data.recommendations || [];
-  const warns = data.iv_warnings || [];
-
-  document.getElementById('recsBadge').textContent = recs.length + ' active';
-
-  const recsEl = document.getElementById('optRecs');
-  if (!recs.length) {
-    recsEl.innerHTML = '<p class="empty">No option recommendations yet</p>';
-  } else {
-    recsEl.innerHTML = recs.map(r => {
-      const badge  = r.signal === 'BUY' ? '<span class="b b-buy">BUY</span>' : '<span class="b b-sell">SELL</span>';
-      const strike = r.option_strike ? '$' + Number(r.option_strike).toFixed(0) : '—';
-      const cost   = r.option_cost   ? '$' + Number(r.option_cost).toFixed(2)   : '—';
-      const iv     = r.option_iv     ? (r.option_iv * 100).toFixed(0) + '%'     : '—';
-      const delta  = r.option_delta  ? Number(r.option_delta).toFixed(2)        : '—';
-      const when   = timeAgo(r.signal_timestamp);
-      const src    = r.option_price_source;
-      const srcMap = {live:'Live price',intrinsic:'At expiry',estimate:'Estimate (no time val)',expired:'Expired'};
-      const srcLabel = src ? (srcMap[src] || src) : null;
-      const srcCls   = src === 'live' ? 'up' : src === 'expired' ? 'dn' : 'neu';
-      return `<div class="option-item">
-        <div class="option-item-head">
-          <span class="option-ticker">${r.ticker}</span>
-          <div style="display:flex;gap:6px;align-items:center">${badge}<span class="neu" style="font-size:11px">${when}</span></div>
-        </div>
-        <div class="option-meta">
-          <div class="ometa"><span class="ometa-l">Type</span><span class="ometa-v">${r.option_type || '—'}</span></div>
-          <div class="ometa"><span class="ometa-l">Strike</span><span class="ometa-v">${strike}</span></div>
-          <div class="ometa"><span class="ometa-l">Expiry</span><span class="ometa-v">${r.option_expiry || '—'}</span></div>
+    // option section
+    let optHtml = '';
+    if (r.option_contract) {
+      const strike  = r.option_strike  ? '$' + Number(r.option_strike).toFixed(0) : '—';
+      const expiry  = r.option_expiry  || '—';
+      const cost    = r.option_cost    ? '$' + Number(r.option_cost).toFixed(2)   : '—';
+      const iv      = r.option_iv      ? (r.option_iv * 100).toFixed(0) + '%'     : '—';
+      const delta   = r.option_delta   ? Number(r.option_delta).toFixed(2)        : '—';
+      const ivCls   = r.option_iv && r.option_iv > 0.8 ? 'dn' : '';
+      optHtml = `<div class="sig-card-opt">
+        <div class="sig-card-opt-title">${r.option_type || '?'} ${strike} · exp ${expiry}</div>
+        <div class="sig-card-metas">
           <div class="ometa"><span class="ometa-l">Cost</span><span class="ometa-v">${cost}</span></div>
-          <div class="ometa"><span class="ometa-l">IV</span><span class="ometa-v ${r.option_iv > 0.8 ? 'dn' : ''}">${iv}</span></div>
+          <div class="ometa"><span class="ometa-l">IV</span><span class="ometa-v ${ivCls}">${iv}</span></div>
           <div class="ometa"><span class="ometa-l">Delta</span><span class="ometa-v">${delta}</span></div>
-          ${srcLabel ? `<div class="ometa"><span class="ometa-l">P&amp;L Basis</span><span class="ometa-v ${srcCls}">${srcLabel}</span></div>` : ''}
+          <div class="ometa"><span class="ometa-l">Contract</span><span class="ometa-v" style="font-size:10px">${r.option_contract}</span></div>
         </div>
       </div>`;
-    }).join('');
-  }
+    }
 
-  const warnEl = document.getElementById('ivWarn');
-  if (!warns.length) {
-    warnEl.innerHTML = '<p class="empty">No high-IV warnings</p>';
-  } else {
-    warnEl.innerHTML = warns.map(r => {
-      const ivPct = r.option_iv * 100;
-      const cls   = ivPct > 100 ? '' : 'iv-warn';
-      const badge = `<span class="b b-warn">IV ${ivPct.toFixed(0)}%</span>`;
-      return `<div class="iv-item ${cls}">
-        <div class="option-item-head">
-          <span class="option-ticker">${r.ticker}</span>
-          ${badge}
+    // entry + live price row
+    const entryStr = r.price_at_signal != null ? '$' + Number(r.price_at_signal).toFixed(2) : '—';
+    const priceRow = `<div class="sig-card-prices">
+      Entry <span>${entryStr}</span>
+      &nbsp;·&nbsp; Live <span class="price-cell" data-ticker="${tk}">—</span>
+      &nbsp;<span class="chg-cell" data-ticker="${tk}"></span>
+    </div>`;
+
+    // outcome chips
+    let outcomes = [];
+    if (r.percent_change_6h != null) {
+      const cls = r.outcome_6h === 'WIN' ? 'b-win' : 'b-loss';
+      const sign = r.percent_change_6h >= 0 ? '+' : '';
+      outcomes.push(`<span class="sco-item"><span class="sco-label">6h</span><span class="b ${cls}">${sign}${Number(r.percent_change_6h).toFixed(2)}%</span></span>`);
+    } else {
+      outcomes.push('<span class="sco-item"><span class="sco-label">6h</span><span class="b b-pending">PENDING</span></span>');
+    }
+    if (r.percent_change_24h != null) {
+      const cls = r.outcome === 'WIN' ? 'b-win' : 'b-loss';
+      const sign = r.percent_change_24h >= 0 ? '+' : '';
+      outcomes.push(`<span class="sco-item"><span class="sco-label">24h</span><span class="b ${cls}">${sign}${Number(r.percent_change_24h).toFixed(2)}%</span></span>`);
+    } else {
+      outcomes.push('<span class="sco-item"><span class="sco-label">24h</span><span class="b b-pending">PENDING</span></span>');
+    }
+
+    // option outcome
+    const optRet = r.option_return_7d ?? r.option_return_24h ?? r.option_return_6h;
+    if (optRet != null) {
+      const sign = optRet >= 0 ? '+' : '';
+      const cls  = optRet >= 0 ? 'b-win' : 'b-loss';
+      const optProfit = r.option_profit_7d ?? r.option_profit_24h ?? r.option_profit_6h;
+      const profitStr = optProfit != null ? ' (' + (optProfit >= 0 ? '+$' : '-$') + Math.abs(optProfit).toFixed(0) + ')' : '';
+      outcomes.push(`<span class="sco-item"><span class="sco-label">Opt</span><span class="b ${cls}">${sign}${optRet.toFixed(1)}%${profitStr}</span></span>`);
+    }
+
+    return `<div class="sig-card ${sigCls}" style="animation-delay:${Math.min(i * 20, 400)}ms">
+      <div class="sig-card-head">
+        <div class="sig-card-left">
+          <span class="sig-card-ticker">${r.ticker}</span>
+          ${dirBadge}
+          ${strongBadge}
         </div>
-        <div class="option-meta">
-          <div class="ometa"><span class="ometa-l">Strike</span><span class="ometa-v">${r.option_strike ? '$' + r.option_strike : '—'}</span></div>
-          <div class="ometa"><span class="ometa-l">Expiry</span><span class="ometa-v">${r.option_expiry || '—'}</span></div>
-          <div class="ometa"><span class="ometa-l">Signal</span><span class="ometa-v">${r.signal}</span></div>
-          <div class="ometa"><span class="ometa-l">Entry</span><span class="ometa-v">${fmt$(r.price_at_signal)}</span></div>
-        </div>
-      </div>`;
-    }).join('');
-  }
-}
-
-async function refreshSignals() {
-  const sigs = await get('/api/signals');
-  if (!sigs) {
-    document.getElementById('sigFeed').innerHTML = '<p class="empty" style="color:var(--red)">Could not load signals — server may be offline</p>';
-    return;
-  }
-
-  const feed = document.getElementById('sigFeed');
-  document.getElementById('sigBadge').textContent = sigs.length + ' recent';
-
-  if (!sigs.length) {
-    feed.innerHTML = '<p class="empty">No signals generated yet</p>';
-    return;
-  }
-
-  feed.innerHTML = sigs.map(s => {
-    const cls = s.signal === 'BUY' ? 'sp-buy' : s.signal === 'SELL' ? 'sp-sell' : 'sp-hold';
-    const t   = shortTime(s.generated_at);
-    return `<div class="sig-pill ${cls}">
-      <span class="sig-time">${t}</span>
-      <span class="sig-ticker">${s.ticker}</span>
-      <span>${s.signal}</span>
+        <span class="sig-card-when">${when}</span>
+      </div>
+      ${optHtml}
+      ${priceRow}
+      <div class="sig-card-outcomes">${outcomes.join('')}</div>
     </div>`;
   }).join('');
 }
 
+// ── Performance History ───────────────────────────────────────────────────────
+
+async function refreshHistory() {
+  const rows = await get('/api/history');
+  if (!rows) {
+    document.getElementById('histGroups').innerHTML = '<p class="empty" style="color:var(--red)">Could not load history.</p>';
+    return;
+  }
+  historyData = rows;
+  renderHistStats(rows);
+  renderHistGroups(rows);
+}
+
+function renderHistStats(rows) {
+  const resolved24 = rows.filter(r => r.percent_change_24h != null);
+  const resolvedAny = rows.filter(r => r.percent_change_24h != null || r.percent_change_6h != null);
+
+  function bestPct(r) { return r.percent_change_24h ?? r.percent_change_6h ?? -Infinity; }
+  function worstPct(r) { return r.percent_change_24h ?? r.percent_change_6h ?? Infinity; }
+
+  const wins24  = resolved24.filter(r => r.outcome === 'WIN').length;
+  const wr      = resolved24.length ? (wins24 / resolved24.length * 100).toFixed(1) : null;
+  const best    = resolvedAny.length ? resolvedAny.reduce((a,b) => bestPct(a) >= bestPct(b) ? a : b) : null;
+  const worst   = resolvedAny.length ? resolvedAny.reduce((a,b) => worstPct(a) <= worstPct(b) ? a : b) : null;
+
+  let totalPnl = 0, hasPnl = false;
+  rows.forEach(r => {
+    const p = r.option_profit_7d ?? r.option_profit_24h ?? r.option_profit_6h;
+    if (p != null) { totalPnl += p; hasPnl = true; }
+  });
+
+  const hmc0 = document.getElementById('hmc0'), hmv0 = document.getElementById('hmv0'), hms0 = document.getElementById('hms0');
+  if (wr != null) {
+    hmv0.textContent = wr + '%';
+    hmc0.className = 'metric-card ' + (parseFloat(wr) >= 50 ? 'c-green' : 'c-red');
+    hms0.textContent = resolved24.length + ' resolved';
+  } else { hmv0.textContent = 'N/A'; hmc0.className = 'metric-card'; hms0.textContent = 'no resolved signals'; }
+
+  const hmc1 = document.getElementById('hmc1'), hmv1 = document.getElementById('hmv1'), hms1 = document.getElementById('hms1');
+  if (best) {
+    const p = bestPct(best); hmv1.textContent = best.ticker; hmc1.className = 'metric-card c-green';
+    hms1.textContent = (p >= 0 ? '+' : '') + p.toFixed(2) + '% · ' + best.signal;
+  } else { hmv1.textContent = 'N/A'; hmc1.className = 'metric-card'; hms1.textContent = 'no data'; }
+
+  const hmc2 = document.getElementById('hmc2'), hmv2 = document.getElementById('hmv2'), hms2 = document.getElementById('hms2');
+  if (worst) {
+    const p = worstPct(worst); hmv2.textContent = worst.ticker; hmc2.className = 'metric-card c-red';
+    hms2.textContent = (p >= 0 ? '+' : '') + p.toFixed(2) + '% · ' + worst.signal;
+  } else { hmv2.textContent = 'N/A'; hmc2.className = 'metric-card'; hms2.textContent = 'no data'; }
+
+  const hmc3 = document.getElementById('hmc3'), hmv3 = document.getElementById('hmv3'), hms3 = document.getElementById('hms3');
+  if (hasPnl) {
+    hmv3.textContent = (totalPnl >= 0 ? '+$' : '-$') + Math.abs(totalPnl).toFixed(0);
+    hmc3.className = 'metric-card ' + (totalPnl >= 0 ? 'c-green' : 'c-red');
+    hms3.textContent = '1 contract each';
+  } else { hmv3.textContent = 'N/A'; hmc3.className = 'metric-card'; hms3.textContent = 'no resolved options'; }
+}
+
+function renderHistGroups(rows) {
+  if (!rows.length) {
+    document.getElementById('histGroups').innerHTML = '<p class="empty">No performance data yet.</p>';
+    document.getElementById('filterCount').textContent = '';
+    return;
+  }
+
+  // group by date
+  const groups = {};
+  rows.forEach(r => {
+    const date = (r.signal_timestamp || 'Unknown').slice(0, 10);
+    if (!groups[date]) groups[date] = [];
+    groups[date].push(r);
+  });
+
+  const sortedDates = Object.keys(groups).sort((a,b) => b.localeCompare(a));
+
+  // open all groups by default if first load
+  if (openGroups.size === 0) sortedDates.forEach(d => openGroups.add(d));
+
+  const container = document.getElementById('histGroups');
+  container.innerHTML = sortedDates.map(date => {
+    const grpRows = groups[date];
+    const wins    = grpRows.filter(r => (r.outcome === 'WIN' || r.outcome_6h === 'WIN')).length;
+    const losses  = grpRows.filter(r => (r.outcome === 'LOSS' || r.outcome_6h === 'LOSS')).length;
+    const pending = grpRows.filter(r => r.outcome === 'PENDING' && r.outcome_6h !== 'WIN' && r.outcome_6h !== 'LOSS').length;
+    const isOpen  = openGroups.has(date);
+
+    const winChip     = wins    ? `<span class="dg-oc win">${wins} WIN</span>`      : '';
+    const lossChip    = losses  ? `<span class="dg-oc loss">${losses} LOSS</span>`  : '';
+    const pendingChip = pending ? `<span class="dg-oc pending">${pending} PENDING</span>` : '';
+
+    const tableRows = grpRows.map((r, i) => {
+      const stockOut24 = r.outcome    || 'PENDING';
+      const stockOut6  = r.outcome_6h || 'PENDING';
+      const stockEff   = stockOut24 !== 'PENDING' ? stockOut24 : stockOut6;
+      const optRet  = r.option_return_7d  ?? r.option_return_24h  ?? r.option_return_6h;
+      const optVal  = r.option_value_7d   ?? r.option_value_24h   ?? r.option_value_6h;
+      const optCost = r.option_cost;
+      const optSrc  = r.option_price_source;
+      const optEff  = optRet == null ? 'PENDING' : optRet > 0 ? 'WIN' : 'LOSS';
+      const eff     = r.option_contract ? optEff : stockEff;
+      const trCls   = eff === 'WIN' ? 't-win' : eff === 'LOSS' ? 't-loss' : 't-pending';
+      const outData = eff === 'WIN' ? 'WIN' : eff === 'LOSS' ? 'LOSS' : 'PENDING';
+
+      const dirBadge = r.signal === 'BUY'
+        ? '<span class="b b-buy">BUY</span>'
+        : r.signal === 'SELL'
+        ? '<span class="b b-sell">SELL</span>'
+        : '<span class="b b-hold">HOLD</span>';
+
+      const outBadge = eff === 'WIN'
+        ? '<span class="b b-win">WIN</span>'
+        : eff === 'LOSS'
+        ? '<span class="b b-loss">LOSS</span>'
+        : '<span class="b b-pending">PENDING</span>';
+
+      const opt = r.option_contract
+        ? `<span title="${r.option_contract}">${r.option_type || '?'}&nbsp;$${r.option_strike || '?'}</span>`
+        : '<span class="neu">—</span>';
+
+      let optRetHtml = '<span class="neu">—</span>';
+      if (optRet != null && optCost != null) {
+        const profit = optVal != null ? optVal - optCost : null;
+        const cls    = optRet >= 0 ? 'up' : 'dn';
+        const sign   = optRet >= 0 ? '+' : '';
+        let str = `<span class="${cls}">${sign}${optRet.toFixed(1)}%`;
+        if (profit != null) str += `<br><small>${profit >= 0 ? '+' : ''}$${Math.abs(profit).toFixed(0)}</small>`;
+        if (optSrc) {
+          const srcMap = {live:'Live',intrinsic:'At Expiry',estimate:'Est.',expired:'Expired'};
+          const srcCls = optSrc === 'live' ? 'up' : optSrc === 'expired' ? 'dn' : 'neu';
+          str += `<br><small class="${srcCls}" style="font-size:9px">${srcMap[optSrc]||optSrc}</small>`;
+        }
+        str += '</span>';
+        optRetHtml = str;
+      }
+
+      const tk = (r.ticker || '').replace(/[^A-Z0-9.]/g, '');
+
+      return `<tr class="${trCls} hist-row" data-signal="${r.signal || ''}" data-outcome="${outData}" style="animation-delay:${Math.min(i * 12, 300)}ms">
+        <td><span class="ticker-name">${r.ticker}</span></td>
+        <td>${dirBadge}</td>
+        <td class="mono">${fmt$(r.price_at_signal)}</td>
+        <td class="mono price-cell" data-ticker="${tk}"><span class="neu">—</span></td>
+        <td class="mono">${fmtPct(r.percent_change_6h)}</td>
+        <td class="mono">${fmtPct(r.percent_change_24h)}</td>
+        <td class="mono">${fmtPct(r.percent_change_7d)}</td>
+        <td class="mono">${opt}</td>
+        <td class="mono">${fmtIV(r.option_iv)}</td>
+        <td class="mono">${optRetHtml}</td>
+        <td>${outBadge}</td>
+      </tr>`;
+    }).join('');
+
+    return `<div class="date-group">
+      <div class="dg-header${isOpen ? '' : ' collapsed'}" onclick="toggleGroup(this,'${date}')">
+        <div class="dg-header-left">
+          <span class="dg-date">${fmtGroupDate(date)}</span>
+          <span class="dg-count">${grpRows.length} signal${grpRows.length !== 1 ? 's' : ''}</span>
+          <div class="dg-outcomes">${winChip}${lossChip}${pendingChip}</div>
+        </div>
+        <span class="dg-arrow">&#9660;</span>
+      </div>
+      <div class="dg-body" id="dgb-${date}" style="display:${isOpen ? '' : 'none'}">
+        <div class="table-scroll">
+          <table class="perf-table">
+            <thead><tr>
+              <th>Ticker</th><th>Dir</th><th>Entry</th><th>Live</th>
+              <th>6h</th><th>24h</th><th>7d</th>
+              <th>Option</th><th>IV</th><th>Opt Ret</th><th>Outcome</th>
+            </tr></thead>
+            <tbody>${tableRows}</tbody>
+          </table>
+        </div>
+      </div>
+    </div>`;
+  }).join('');
+
+  applyHistFilter();
+}
+
+function toggleGroup(header, date) {
+  const body = document.getElementById('dgb-' + date);
+  if (!body) return;
+  const isOpen = body.style.display !== 'none';
+  body.style.display = isOpen ? 'none' : '';
+  header.classList.toggle('collapsed', isOpen);
+  if (isOpen) openGroups.delete(date); else openGroups.add(date);
+}
+
+function setFilter(f) {
+  histFilter = f;
+  document.querySelectorAll('.filter-btn').forEach(b => b.classList.toggle('active', b.dataset.filter === f));
+  applyHistFilter();
+}
+
+function applyHistFilter() {
+  let visible = 0;
+  document.querySelectorAll('.hist-row').forEach(row => {
+    const sig = row.dataset.signal;
+    const out = row.dataset.outcome;
+    let show = histFilter === 'ALL'
+      || (histFilter === 'BUY'     && sig === 'BUY')
+      || (histFilter === 'SELL'    && sig === 'SELL')
+      || (histFilter === 'WIN'     && out === 'WIN')
+      || (histFilter === 'LOSS'    && out === 'LOSS')
+      || (histFilter === 'PENDING' && out === 'PENDING');
+    row.style.display = show ? '' : 'none';
+    if (show) visible++;
+  });
+  // hide empty date groups
+  document.querySelectorAll('.date-group').forEach(grp => {
+    const body = grp.querySelector('.dg-body');
+    if (!body) return;
+    const anyVisible = body.querySelector('.hist-row:not([style*="none"])');
+    grp.style.display = anyVisible ? '' : 'none';
+  });
+  const total = historyData.length;
+  document.getElementById('filterCount').textContent = histFilter === 'ALL'
+    ? total + ' total'
+    : visible + ' of ' + total;
+}
+
+// ── Ticker bar ────────────────────────────────────────────────────────────────
+
 function updateTickerBar(data) {
   if (!data || !data.length) return;
   const track = document.getElementById('tickerTrack');
-
   const items = data.map(({ ticker, price, change_pct }) => {
     const isUp  = change_pct != null && change_pct >= 0;
     const isDn  = change_pct != null && change_pct < 0;
     const cls   = isDn ? 'dn' : isUp ? 'up' : 'neu';
     const arrow = isDn ? '▼' : isUp ? '▲' : '';
     const pStr  = price != null ? '$' + Number(price).toFixed(2) : '—';
-    const cStr  = change_pct != null
-      ? (change_pct >= 0 ? '+' : '') + Number(change_pct).toFixed(2) + '%'
-      : '';
-    return `<span class="ti-item">` +
-      `<span class="ti-ticker">${ticker}</span>` +
-      ` <span class="${cls}">` +
-        (arrow ? `<span class="ti-arrow">${arrow}</span> ` : '') +
-        `${pStr}</span>` +
-      (cStr ? ` <span class="${cls}">${cStr}</span>` : '') +
-      `</span>`;
+    const cStr  = change_pct != null ? (change_pct >= 0 ? '+' : '') + Number(change_pct).toFixed(2) + '%' : '';
+    return `<span class="ti-item"><span class="ti-ticker">${ticker}</span> <span class="${cls}">${arrow ? `<span class="ti-arrow">${arrow}</span> ` : ''}${pStr}</span>${cStr ? ` <span class="${cls}">${cStr}</span>` : ''}</span>`;
   }).join('<span class="ti-sep">·</span>');
-
-  // Duplicate for seamless infinite scroll
-  const sep  = '<span class="ti-sep" style="padding:0 12px">·</span>';
+  const sep = '<span class="ti-sep" style="padding:0 12px">·</span>';
   track.innerHTML = items + sep + items;
-
   const dur = Math.max(20, data.length * 5);
   track.style.animation = 'none';
-  void track.offsetWidth; // force reflow to restart
+  void track.offsetWidth;
   track.style.animation = `ticker-scroll ${dur}s linear infinite`;
 }
 
+// ── Live prices ───────────────────────────────────────────────────────────────
+
 async function refreshPrices() {
   const data = await get('/api/prices');
-
   if (data && data.length) {
     data.forEach(({ ticker, price, change_pct }) => {
       const isUp  = change_pct != null && change_pct >= 0;
@@ -1544,48 +1192,41 @@ async function refreshPrices() {
       const pStr  = price != null ? '$' + Number(price).toFixed(2) : '—';
       const cStr  = change_pct != null
         ? `<span class="${cls}">${change_pct >= 0 ? '+' : ''}${Number(change_pct).toFixed(2)}%</span>`
-        : `<span class="neu">—</span>`;
-
-      const priceHtml = price != null
+        : '<span class="neu">—</span>';
+      const pHtml = price != null
         ? `<span class="${cls}">${arrow ? `<span class="ti-arrow">${arrow}</span> ` : ''}${pStr}</span>`
-        : `<span class="neu">—</span>`;
-
-      document.querySelectorAll(`.price-cell[data-ticker="${ticker}"]`).forEach(el => {
-        el.innerHTML = priceHtml;
-      });
-      document.querySelectorAll(`.chg-cell[data-ticker="${ticker}"]`).forEach(el => {
-        el.innerHTML = cStr;
-      });
+        : '<span class="neu">—</span>';
+      document.querySelectorAll(`.price-cell[data-ticker="${ticker}"]`).forEach(el => { el.innerHTML = pHtml; });
+      document.querySelectorAll(`.chg-cell[data-ticker="${ticker}"]`).forEach(el => { el.innerHTML = cStr; });
     });
-
     updateTickerBar(data);
   }
-
-  // Flash the prices-live dot
   const dot = document.getElementById('plDot');
-  dot.classList.remove('flash');
-  void dot.offsetWidth;
-  dot.classList.add('flash');
+  dot.classList.remove('flash'); void dot.offsetWidth; dot.classList.add('flash');
   setTimeout(() => dot.classList.remove('flash'), 700);
-
   kickProgress();
 }
 
 function kickProgress() {
   const el = document.getElementById('pgFill');
-  el.classList.remove('run');
-  void el.offsetWidth;
-  el.classList.add('run');
+  el.classList.remove('run'); void el.offsetWidth; el.classList.add('run');
 }
 
-async function refreshPipeline() {
-  await Promise.all([refreshStats(), refreshPerf(), refreshOptions(), refreshSignals()]);
-  await refreshPrices(); // fill live price cells immediately after table rebuild
+// ── Boot ──────────────────────────────────────────────────────────────────────
+
+async function boot() {
+  await Promise.all([refreshStats(), refreshToday()]);
+  await refreshPrices();
 }
 
-refreshPipeline();
-setInterval(refreshPipeline, PIPELINE_INTERVAL);
-setInterval(refreshPrices,  PRICE_INTERVAL);
+boot();
+setInterval(async () => {
+  await refreshStats();
+  if (currentTab === 'today') await refreshToday();
+  else { await refreshHistory(); }
+  await refreshPrices();
+}, PIPELINE_INTERVAL);
+setInterval(refreshPrices, PRICE_INTERVAL);
 </script>
 </body>
 </html>"""
