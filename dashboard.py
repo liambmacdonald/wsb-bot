@@ -1201,11 +1201,42 @@ function renderHistStats(rows) {
     const raw = r.percent_change_24h ?? r.percent_change_6h;
     return r.signal === 'SELL' ? -raw : raw;
   });
-  console.log('[Overall Avg Return] resolved trades:', resolvedForAvg.map((r, i) => ({
-    ticker: r.ticker, signal: r.signal,
-    raw_pct: r.percent_change_24h ?? r.percent_change_6h,
-    effective_return: effectiveReturns[i]
-  })));
+  // ── Overall Avg Return full audit ────────────────────────────────────────
+  console.group('[Overall Avg Return] Full audit');
+  const _holdInRows = rows.filter(r => r.signal === 'HOLD');
+  if (_holdInRows.length) {
+    console.warn('WARNING: ' + _holdInRows.length + ' HOLD row(s) leaked through API filter:', _holdInRows.map(r => ({id: r.id, ticker: r.ticker})));
+  } else {
+    console.log('HOLD check: 0 HOLD rows in API response (correct — SQL already excludes HOLD)');
+  }
+  console.log('Total rows from API: ' + rows.length + '  |  BUY/SELL only (actionRows): ' + actionRows.length);
+  const _auditTable = actionRows.map(r => {
+    const _has24h = r.percent_change_24h != null;
+    const _has6h  = r.percent_change_6h  != null;
+    const _incl   = _has24h || _has6h;
+    const _raw    = _has24h ? r.percent_change_24h : (_has6h ? r.percent_change_6h : null);
+    const _eff    = (_incl && _raw != null) ? (r.signal === 'SELL' ? -_raw : _raw) : null;
+    return {
+      id:            r.id,
+      ticker:        r.ticker,
+      signal:        r.signal,
+      entry_price:   r.price_at_signal != null  ? r.price_at_signal.toFixed(4)  : null,
+      price_24h:     r.price_24h_later != null  ? r.price_24h_later.toFixed(4)  : null,
+      raw_pct:       _raw  != null ? _raw.toFixed(4)  + '%' : null,
+      effective_pct: _eff  != null ? _eff.toFixed(4)  + '%' : null,
+      checkpoint:    _has24h ? '24h' : (_has6h ? '6h' : 'none'),
+      status:        _incl ? 'INCLUDED' : 'EXCLUDED',
+      reason:        _incl ? (_has24h ? 'has 24h checkpoint' : '6h only') : 'no resolved checkpoint'
+    };
+  });
+  console.table(_auditTable);
+  const _sum   = effectiveReturns.reduce((s, v) => s + v, 0);
+  const _count = effectiveReturns.length;
+  console.log('--- Math verification ---');
+  console.log('Included count : ' + _count);
+  console.log('Sum of effective returns: ' + _sum.toFixed(6) + '%');
+  console.log('Final average  : ' + (_count > 0 ? (_sum / _count).toFixed(6) + '%' : 'N/A — no included trades'));
+  console.groupEnd();
   const avgRet = effectiveReturns.length
     ? effectiveReturns.reduce((s, v) => s + v, 0) / effectiveReturns.length
     : null;
@@ -1216,21 +1247,63 @@ function renderHistStats(rows) {
     hms0.textContent = resolvedForAvg.length + " resolved signals";
   } else { hmv0.textContent = "N/A"; hmc0.className = "metric-card"; hms0.textContent = "no resolved signals"; }
 
-  // Options win rate
-  const optRows = actionRows.filter(r =>
-    r.close_return_pct != null ||
-    r.option_return_6h != null || r.option_return_24h != null || r.option_return_7d != null
+  // Options Avg Return — trades with option data and at least one resolved 6h/24h checkpoint
+  // Sign is NOT flipped for SELL: options P&L is already directionally correct
+  const optAvgRows = actionRows.filter(r =>
+    r.option_return_24h != null || r.option_return_6h != null
   );
-  const optWins = optRows.filter(r => (r.close_return_pct ?? r.option_return_7d ?? r.option_return_24h ?? r.option_return_6h ?? 0) > 0).length;
-  const optWR   = optRows.length ? (optWins / optRows.length * 100).toFixed(1) : null;
-  // Re-use metric-card 1 as Options Win Rate
+  const optEffectiveReturns = optAvgRows.map(r =>
+    r.option_return_24h != null ? r.option_return_24h : r.option_return_6h
+  );
+  const optAvg   = optEffectiveReturns.length ? optEffectiveReturns.reduce((s, v) => s + v, 0) / optEffectiveReturns.length : null;
+  const optBest  = optEffectiveReturns.length ? Math.max(...optEffectiveReturns) : null;
+  const optWorst = optEffectiveReturns.length ? Math.min(...optEffectiveReturns) : null;
+  // ── Options Avg Return full audit ────────────────────────────────────────
+  console.group('[Options Avg Return] Full audit');
+  const _holdInOptRows = rows.filter(r => r.signal === 'HOLD');
+  if (_holdInOptRows.length) {
+    console.warn('WARNING: ' + _holdInOptRows.length + ' HOLD row(s) in rows:', _holdInOptRows.map(r => ({id: r.id, ticker: r.ticker})));
+  } else {
+    console.log('HOLD check: 0 HOLD rows (correct)');
+  }
+  console.log('Total actionRows: ' + actionRows.length);
+  const _optAuditTable = actionRows.map(r => {
+    const _has24h = r.option_return_24h != null;
+    const _has6h  = r.option_return_6h  != null;
+    const _incl   = _has24h || _has6h;
+    const _eff    = _has24h ? r.option_return_24h : (_has6h ? r.option_return_6h : null);
+    return {
+      id:          r.id,
+      ticker:      r.ticker,
+      signal:      r.signal,
+      opt_ret_24h: r.option_return_24h != null ? r.option_return_24h.toFixed(4) + '%' : null,
+      opt_ret_6h:  r.option_return_6h  != null ? r.option_return_6h.toFixed(4)  + '%' : null,
+      effective:   _eff != null ? _eff.toFixed(4) + '%' : null,
+      checkpoint:  _has24h ? '24h' : (_has6h ? '6h' : 'none'),
+      sign_flip:   'NO — options P&L already directional',
+      status:      _incl ? 'INCLUDED' : 'EXCLUDED',
+      reason:      _incl ? (_has24h ? 'has 24h checkpoint' : '6h only') : 'no option checkpoint'
+    };
+  });
+  console.table(_optAuditTable);
+  const _optSum = optEffectiveReturns.reduce((s, v) => s + v, 0);
+  console.log('--- Math verification ---');
+  console.log('Included count : ' + optEffectiveReturns.length);
+  console.log('Sum of effective returns: ' + _optSum.toFixed(6) + '%');
+  console.log('Final average  : ' + (optAvg != null ? optAvg.toFixed(6) + '%' : 'N/A — no included trades'));
+  console.log('Best  : ' + (optBest  != null ? optBest.toFixed(4)  + '%' : 'N/A'));
+  console.log('Worst : ' + (optWorst != null ? optWorst.toFixed(4) + '%' : 'N/A'));
+  console.groupEnd();
   const hmc1 = document.getElementById('hmc1'), hmv1 = document.getElementById('hmv1'), hms1 = document.getElementById('hms1');
-  document.querySelector('#hmc1 .metric-label').textContent = 'Options Win Rate';
-  if (optWR != null) {
-    hmv1.textContent = optWR + '%';
-    hmc1.className = 'metric-card ' + (parseFloat(optWR) >= 50 ? 'c-green' : 'c-red');
-    hms1.textContent = optRows.length + " resolved options";
-  } else { hmv1.textContent = "N/A"; hmc1.className = "metric-card"; hms1.textContent = "Options win rate · no data"; }
+  document.querySelector('#hmc1 .metric-label').textContent = 'Options Avg Return';
+  if (optAvg != null) {
+    const sign = optAvg >= 0 ? '+' : '';
+    hmv1.textContent = sign + optAvg.toFixed(1) + '%';
+    hmc1.className = 'metric-card ' + (optAvg >= 0 ? 'c-green' : 'c-red');
+    const bestStr  = optBest  != null ? (optBest  >= 0 ? '+' : '') + optBest.toFixed(1)  + '%' : '—';
+    const worstStr = optWorst != null ? (optWorst >= 0 ? '+' : '') + optWorst.toFixed(1) + '%' : '—';
+    hms1.innerHTML = optAvgRows.length + ' resolved options<br>Best: ' + bestStr + ' · Worst: ' + worstStr;
+  } else { hmv1.textContent = 'N/A'; hmc1.className = 'metric-card'; hms1.textContent = 'Options avg return · no data'; }
 
   const hmc2 = document.getElementById('hmc2'), hmv2 = document.getElementById('hmv2'), hms2 = document.getElementById('hms2');
   document.querySelector('#hmc2 .metric-label').textContent = 'Best Call';
