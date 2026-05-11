@@ -10,7 +10,14 @@
       "Bash(findstr \":5000\")",
       "Bash(findstr \"LISTENING\")",
       "Bash(Select-String \":5000.*LISTEN\")",
-      "Bash(grep -v \"innerHTML\\\\|#\\\\|//\")"
+      "Bash(grep -v \"innerHTML\\\\|#\\\\|//\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(curl -s http://localhost:5000/api/stats)",
+      "Bash(curl -s http://localhost:5000/api/performance)",
+      "Bash(curl -s http://127.0.0.1:5000/api/stats)",
+      "Bash(curl -s http://127.0.0.1:5000/api/performance)",
+      "Bash(curl -s http://127.0.0.1:5000/)"
     ]
   }
 }

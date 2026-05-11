@@ -817,8 +817,11 @@ let openGroups  = new Set();
 // ── Utilities ────────────────────────────────────────────────────────────────
 
 async function get(url) {
-  try { const r = await fetch(url); return r.ok ? r.json() : null; }
-  catch { return null; }
+  try {
+    const r = await fetch(url);
+    if (!r.ok) { console.error('API error', url, r.status, r.statusText); return null; }
+    return r.json();
+  } catch(e) { console.error('Fetch failed', url, e.message); return null; }
 }
 
 function fmt$(v) { return v == null ? '<span class="neu">—</span>' : '$' + Number(v).toFixed(2); }
@@ -958,7 +961,7 @@ async function refreshToday() {
     bannerText.innerHTML = 'Markets Closed — Weekend Discussion Active<span> · Next open ' + (next_open || 'Monday 9:30am ET') + '</span>';
   } else if (is_after_hours) {
     banner.style.display = 'flex';
-    bannerText.innerHTML = 'Markets Closed — After Hours<span> · Signals are for tomorrow\'s open · Next open ' + (next_open || 'Tomorrow 9:30am ET') + '</span>';
+    bannerText.innerHTML = 'Markets Closed — After Hours<span> · Signals are for tomorrow&#39;s open · Next open ' + (next_open || 'Tomorrow 9:30am ET') + '</span>';
   } else if (market_open) {
     banner.style.display = 'flex';
     banner.style.background = 'rgba(48,209,88,.07)';
@@ -983,7 +986,7 @@ async function refreshToday() {
     return;
   }
 
-  grid.innerHTML = signals.map((r, i) => {
+  try { grid.innerHTML = signals.map((r, i) => {
     const sigCls   = r.signal === 'BUY' ? 'sc-buy' : 'sc-sell';
     const dirBadge = r.signal === 'BUY'
       ? '<span class="b b-buy">BUY</span>'
@@ -1062,7 +1065,10 @@ async function refreshToday() {
       <div class="sig-card-outcomes">${outcomes.join('')}</div>
       ${statusBadge(r) ? '<div style="margin-top:8px">' + statusBadge(r) + '</div>' : ''}
     </div>`;
-  }).join('');
+  }).join(''); } catch(e) {
+    console.error('refreshToday render error:', e);
+    grid.innerHTML = '<p class="empty" style="color:var(--red)">Render error: ' + e.message + ' — check browser console.</p>';
+  }
 }
 
 // ── Performance History ───────────────────────────────────────────────────────
@@ -1070,12 +1076,18 @@ async function refreshToday() {
 async function refreshHistory() {
   const rows = await get('/api/history');
   if (!rows) {
-    document.getElementById('histGroups').innerHTML = '<p class="empty" style="color:var(--red)">Could not load history.</p>';
+    document.getElementById('histGroups').innerHTML = '<p class="empty" style="color:var(--red)">Could not load /api/history — check browser console for details.</p>';
     return;
   }
   historyData = rows;
-  renderHistStats(rows);
-  renderHistGroups(rows);
+  try { renderHistStats(rows); } catch(e) {
+    console.error('renderHistStats error:', e);
+    document.getElementById('hms0').textContent = 'Render error: ' + e.message;
+  }
+  try { renderHistGroups(rows); } catch(e) {
+    console.error('renderHistGroups error:', e);
+    document.getElementById('histGroups').innerHTML = '<p class="empty" style="color:var(--red)">Render error: ' + e.message + '</p>';
+  }
 }
 
 function renderHistStats(rows) {
