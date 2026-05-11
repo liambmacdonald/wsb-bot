@@ -852,10 +852,10 @@ function timeAgo(ts) {
   try {
     const d = new Date(ts.includes('T') ? ts : ts.replace(' ', 'T') + 'Z');
     const s = Math.floor((Date.now() - d) / 1000);
-    if (s < 60)    return s + 's ago';
-    if (s < 3600)  return Math.floor(s / 60) + 'm ago';
-    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
-    return Math.floor(s / 86400) + 'd ago';
+    if (s < 60)    return s + "s ago";
+    if (s < 3600)  return Math.floor(s / 60) + "m ago";
+    if (s < 86400) return Math.floor(s / 3600) + "h ago";
+    return Math.floor(s / 86400) + "d ago";
   } catch { return '—'; }
 }
 
@@ -886,34 +886,34 @@ async function refreshStats() {
   const d = await get('/api/stats');
   if (!d) {
     const pill = document.getElementById('statusPill');
-    pill.className = 'status-pill offline';
-    document.getElementById('statusLabel').textContent = 'Offline';
+    pill.className = "status-pill offline";
+    document.getElementById('statusLabel').textContent = "Offline";
     return;
   }
   const pill = document.getElementById('statusPill');
   const lbl  = document.getElementById('statusLabel');
-  pill.className = 'status-pill' + (d.bot_state === 'idle' ? ' idle' : d.bot_state !== 'live' ? ' offline' : '');
-  lbl.textContent = d.bot_state === 'live' ? 'Live' : d.bot_state === 'idle' ? 'Idle' : 'Offline';
+  pill.className = "status-pill" + (d.bot_state === "idle" ? " idle" : d.bot_state !== "live" ? " offline" : "");
+  lbl.textContent = d.bot_state === "live" ? "Live" : d.bot_state === "idle" ? "Idle" : "Offline";
 
   if (d.minutes_since_heartbeat != null) {
     const m = d.minutes_since_heartbeat;
-    document.getElementById('navLastRun').textContent = 'Last run: ' + (m < 1 ? 'just now' : Math.round(m) + 'm ago');
+    document.getElementById('navLastRun').textContent = "Last run: " + (m < 1 ? "just now" : Math.round(m) + "m ago");
   }
   if (d.minutes_until_next_run != null) {
     const n = d.minutes_until_next_run;
-    document.getElementById('navNextRun').textContent = 'Next: ' + (n < 1 ? '<1m' : Math.round(n) + 'm');
+    document.getElementById('navNextRun').textContent = "Next: " + (n < 1 ? "<1m" : Math.round(n) + "m");
   }
   if (d.last_posts_collected != null || d.last_signals_generated != null)
-    document.getElementById('navRunStats').textContent = (d.last_posts_collected ?? '—') + ' posts · ' + (d.last_signals_generated ?? '—') + ' signals';
+    document.getElementById('navRunStats').textContent = (d.last_posts_collected ?? "—") + " posts · " + (d.last_signals_generated ?? "—") + " signals";
   document.getElementById('navTime').textContent = d.last_updated || '—';
 
   // Closed trades summary card
   const cs = d.closed_summary;
   if (cs && cs.total > 0) {
     document.getElementById('closedSummaryCard').style.display = '';
-    document.getElementById('closedBadge').textContent = cs.total + ' closed';
-    const avgP = cs.avg_profit_pct != null ? ' (avg +' + cs.avg_profit_pct.toFixed(1) + '%)' : '';
-    const avgL = cs.avg_loss_pct   != null ? ' (avg '  + cs.avg_loss_pct.toFixed(1) + '%)'  : '';
+    document.getElementById('closedBadge').textContent = cs.total + " closed";
+    const avgP = cs.avg_profit_pct != null ? " (avg +" + cs.avg_profit_pct.toFixed(1) + "%)" : "";
+    const avgL = cs.avg_loss_pct   != null ? " (avg "  + cs.avg_loss_pct.toFixed(1) + "%)"  : "";
     document.getElementById('closedSummary').innerHTML = `
       <div class="cs-item"><div class="cs-num" style="color:var(--text)">${cs.total}</div><div class="cs-label">Total Closed</div></div>
       <div class="cs-item"><div class="cs-num" style="color:var(--green)">${cs.profit}</div><div class="cs-label">At Profit</div><div class="cs-sub">${avgP}</div></div>
@@ -927,7 +927,7 @@ async function refreshStats() {
 
 function strengthBar(tw) {
   const pct = Math.min(100, Math.round((tw / 60) * 100));
-  const label = tw >= 40 ? 'Strong' : tw >= 20 ? 'Moderate' : 'Weak';
+  const label = tw >= 40 ? "Strong" : tw >= 20 ? "Moderate" : "Weak";
   return `<div class="strength-bar-wrap">
     <div class="strength-bar-label"><span>Signal Strength</span><span>${label} (${Math.round(tw)} wt)</span></div>
     <div class="strength-track"><div class="strength-fill" style="width:${pct}%"></div></div>
@@ -958,17 +958,17 @@ async function refreshToday() {
   const bannerText = document.getElementById('marketBannerText');
   if (is_weekend) {
     banner.style.display = 'flex';
-    bannerText.innerHTML = 'Markets Closed — Weekend Discussion Active<span> · Next open ' + (next_open || 'Monday 9:30am ET') + '</span>';
+    bannerText.innerHTML = `Markets Closed — Weekend Discussion Active<span> · Next open ${next_open || "Monday 9:30am ET"}</span>`;
   } else if (is_after_hours) {
     banner.style.display = 'flex';
-    bannerText.innerHTML = 'Markets Closed — After Hours<span> · Signals are for tomorrow&#39;s open · Next open ' + (next_open || 'Tomorrow 9:30am ET') + '</span>';
+    bannerText.innerHTML = `Markets Closed — After Hours<span> · Signals are for tomorrow's open · Next open ${next_open || "Tomorrow 9:30am ET"}</span>`;
   } else if (market_open) {
     banner.style.display = 'flex';
     banner.style.background = 'rgba(48,209,88,.07)';
     banner.style.borderColor = 'rgba(48,209,88,.2)';
     banner.style.color = 'var(--green)';
     document.querySelector('.market-banner-icon').textContent = '🟢';
-    bannerText.innerHTML = 'Markets Open — <span>Live Signals</span>';
+    bannerText.innerHTML = "Markets Open — <span>Live Signals</span>";
   } else {
     banner.style.display = 'none';
   }
@@ -1115,8 +1115,8 @@ function renderHistStats(rows) {
   if (wr6h != null) {
     hmv0.textContent = wr6h + '%';
     hmc0.className = 'metric-card ' + (parseFloat(wr6h) >= 50 ? 'c-green' : 'c-red');
-    hms0.textContent = 'Stock win rate · ' + resolved6h.length + ' resolved';
-  } else { hmv0.textContent = 'N/A'; hmc0.className = 'metric-card'; hms0.textContent = 'Stock win rate · no resolved signals'; }
+    hms0.textContent = "Stock win rate · " + resolved6h.length + " resolved";
+  } else { hmv0.textContent = "N/A"; hmc0.className = "metric-card"; hms0.textContent = "Stock win rate · no resolved signals"; }
 
   // Options win rate
   const optRows = actionRows.filter(r =>
@@ -1131,22 +1131,22 @@ function renderHistStats(rows) {
   if (optWR != null) {
     hmv1.textContent = optWR + '%';
     hmc1.className = 'metric-card ' + (parseFloat(optWR) >= 50 ? 'c-green' : 'c-red');
-    hms1.textContent = optRows.length + ' resolved options';
-  } else { hmv1.textContent = 'N/A'; hmc1.className = 'metric-card'; hms1.textContent = 'Options win rate · no data'; }
+    hms1.textContent = optRows.length + " resolved options";
+  } else { hmv1.textContent = "N/A"; hmc1.className = "metric-card"; hms1.textContent = "Options win rate · no data"; }
 
   const hmc2 = document.getElementById('hmc2'), hmv2 = document.getElementById('hmv2'), hms2 = document.getElementById('hms2');
   document.querySelector('#hmc2 .metric-label').textContent = 'Best Call';
   if (best) {
     const p = bestPct(best); hmv2.textContent = best.ticker; hmc2.className = 'metric-card c-green';
-    hms2.textContent = (p >= 0 ? '+' : '') + p.toFixed(2) + '% · ' + best.signal;
-  } else { hmv2.textContent = 'N/A'; hmc2.className = 'metric-card'; hms2.textContent = 'no data'; }
+    hms2.textContent = (p >= 0 ? "+" : "") + p.toFixed(2) + "% · " + best.signal;
+  } else { hmv2.textContent = "N/A"; hmc2.className = "metric-card"; hms2.textContent = "no data"; }
 
   const hmc3 = document.getElementById('hmc3'), hmv3 = document.getElementById('hmv3'), hms3 = document.getElementById('hms3');
   if (hasPnl) {
     hmv3.textContent = (totalPnl >= 0 ? '+$' : '-$') + Math.abs(totalPnl).toFixed(0);
     hmc3.className = 'metric-card ' + (totalPnl >= 0 ? 'c-green' : 'c-red');
-    hms3.textContent = '1 contract each';
-  } else { hmv3.textContent = 'N/A'; hmc3.className = 'metric-card'; hms3.textContent = 'no resolved options'; }
+    hms3.textContent = "1 contract each";
+  } else { hmv3.textContent = "N/A"; hmc3.className = "metric-card"; hms3.textContent = "no resolved options"; }
 }
 
 function renderHistGroups(rows) {
@@ -1318,9 +1318,9 @@ function applyHistFilter() {
     grp.style.display = anyVisible ? '' : 'none';
   });
   const total = historyData.length;
-  document.getElementById('filterCount').textContent = histFilter === 'ALL'
-    ? total + ' total'
-    : visible + ' of ' + total;
+  document.getElementById('filterCount').textContent = histFilter === "ALL"
+    ? total + " total"
+    : visible + " of " + total;
 }
 
 // ── Ticker bar ────────────────────────────────────────────────────────────────
