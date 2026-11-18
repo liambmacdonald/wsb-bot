@@ -14,6 +14,38 @@ A Reddit sentiment trading bot that monitors r/wallstreetbets and uses Claude AI
 
 ---
 
+## Live Test Results
+
+I ran the bot live in May 2026. The test was kept short because every analysis cycle costs Anthropic API credits.
+
+**Activity:** 1,023 posts collected, 756 analyzed by Claude, 80 signals generated (42 BUY, 22 SELL, 16 HOLD), and 66 simulated trades logged.
+
+**Stock signals (24-hour outcome)**
+
+After removing duplicate entries and trades whose checks fell while the market was closed, 42 trades had a real result:
+
+| Signal type | Trades | Win rate | Avg 24h return |
+|---|---|---|---|
+| All signals | 42 | 57% | +0.85% |
+| BUY | 30 | 60% | +1.05% |
+| SELL | 12 | 50% | +0.35% |
+
+- Best calls: RKLB BUY (+34%), INTC BUY (+14%), AMD BUY (+11%), CRWV SELL (+11%)
+- Worst calls: NET BUY (-24%), ASTS BUY (-12%), SNDK BUY (-7%)
+- Median return was only +0.05%, so a few large winners carried the average
+
+**Options recommendations (24-hour outcome)**
+
+- 26 contracts tracked, 38% profitable
+- Buying one of each would have cost about $52,000 and lost about $3,400 (-6.6%)
+- A single SNDK call accounted for most of the loss (-$4,945)
+
+**Conclusion**
+
+The full pipeline works end to end, but this test does not show that WSB sentiment predicts stock moves. A 57% win rate on 42 trades is close to a coin flip, and results swung with the overall market (77% correct in the strongest session, 25% in the weakest). On the options side, time decay and the high implied volatility of WSB favorites turned small stock moves into losses on most contracts. The target for even considering real money is 200+ resolved trades at a 65%+ win rate, so the bot remains a paper-trading research project.
+
+---
+
 ## How It Works
 
 Each pipeline cycle runs these stages in order:
@@ -157,6 +189,18 @@ For each BUY/SELL signal, the bot fetches a live options recommendation:
 - **Liquidity filter**: open interest 100+, bid $0.10+
 - **IV warnings**: color-coded: orange at 60–80% IV, red above 80%
 - **Sizing**: conservative suggestion based on confidence score; max 1–2 contracts recommended
+
+---
+
+## Known Issues and Next Steps
+
+Issues found during the live test, to fix before collecting more data:
+
+- **Duplicate trades:** some signals were logged twice within seconds of each other
+- **Weekend checks:** 6h and 24h checks that land while the market is closed record 0% change and get scored as losses
+- **Contradictory signals:** the bot occasionally issued BUY and SELL on the same ticker minutes apart
+- **Options price lookups:** a failed lookup is stored as a $0 value (-100%) instead of being retried
+- **Reddit API:** swap the public `.json` endpoint for PRAW once official API access is approved
 
 ---
 
